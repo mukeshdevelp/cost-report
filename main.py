@@ -129,12 +129,12 @@ def parse_arn(arn):
 
 ACTIVE = {"running", "available", "in-use", "in_use", "active", "inservice", "in_service",
           "ready", "completed", "enabled", "associated", "healthy", "attached", "normal",
-          "succeeded", "valid", "issued"}
+          "succeeded", "valid", "issued", "online", "deployed", "prepared"}
 PENDING = {"pending", "creating", "starting", "provisioning", "initializing", "updating",
            "modifying", "backing-up", "upgrading", "rebooting", "in_progress", "inprogress",
            "processing", "importing", "scaling", "renaming", "configuring-enhanced-monitoring",
            "storage-optimization", "resetting-master-credentials", "pending-update"}
-INACTIVE = {"stopped", "stopping", "inactive", "disabled", "stopped-by-aws"}
+INACTIVE = {"stopped", "stopping", "inactive", "disabled", "stopped-by-aws", "offline"}
 BAD = {"deleting", "deleted", "failed", "error", "terminated", "shutting-down",
        "create_failed", "delete_failed", "active_impaired", "unhealthy"}
 
@@ -190,6 +190,14 @@ SERVICE_COST_KEYS = {
     "apigateway": ["api gateway"],
     "elasticfilesystem": ["elastic file system"],
     "ssm": ["systems manager"],
+    "route53": ["route 53"],
+    "transfer": ["transfer family"],
+    "mq": ["amazon mq"],
+    "kafka": ["managed streaming"],
+    "firehose": ["firehose"],
+    "events": ["eventbridge", "cloudwatch events"],
+    "wafv2": ["waf"],
+    "backup": ["backup"],
 }
 
 BILLABLE_EC2 = {"instance", "volume", "snapshot", "natgateway", "elastic-ip",
@@ -326,6 +334,11 @@ def sc_ec2(s):
             t = tags_of(e.get("Tags"))
             s.add(s.arn("ec2", f"vpc-endpoint/{e['VpcEndpointId']}"), t.get("Name"),
                   e.get("State"), t, e.get("CreationTimestamp"))
+    for p in pages(ec2, "describe_images", Owners=["self"]):
+        for im in p.get("Images", []):
+            t = tags_of(im.get("Tags"))
+            s.add(s.arn("ec2", f"image/{im['ImageId']}", with_account=False),
+                  im.get("Name"), im.get("State"), t, im.get("CreationDate"))
 
 
 def sc_rds(s):
@@ -493,16 +506,239 @@ def sc_ecr(s):
             s.add(r["repositoryArn"], r["repositoryName"], "active", {}, r.get("createdAt"))
 
 
+def sc_sqs(s):
+    sqs = s.client("sqs")
+    for p in pages(sqs, "list_queues"):
+        for url in p.get("QueueUrls") or []:
+            name = url.rsplit("/", 1)[-1]
+            s.add(s.arn("sqs", name), name, "active", {})
+
+
+def sc_sns(s):
+    sns = s.client("sns")
+    for p in pages(sns, "list_topics"):
+        for t in p.get("Topics", []):
+            s.add(t["TopicArn"], t["TopicArn"].rsplit(":", 1)[-1], "active", {})
+
+
+def sc_kms(s):
+    kms = s.client("kms")
+    aliases = {}
+    for p in pages(kms, "list_aliases"):
+        for a in p.get("Aliases", []):
+            if a.get("TargetKeyId") and not a["AliasName"].startswith("alias/aws/"):
+                aliases[a["TargetKeyId"]] = a["AliasName"]
+    for p in pages(kms, "list_keys"):
+        for k in p.get("Keys", []):
+            try:
+                m = kms.describe_key(KeyId=k["KeyId"])["KeyMetadata"]
+            except (ClientError, BotoCoreError):
+                continue
+            if m.get("KeyManager") != "CUSTOMER" or m.get("KeyState") == "PendingDeletion":
+                continue
+            s.add(m["Arn"], aliases.get(m["KeyId"], m["KeyId"]), m.get("KeyState", "Enabled"),
+                  {}, m.get("CreationDate"))
+
+
+def sc_stepfunctions(s):
+    sf = s.client("stepfunctions")
+    for p in pages(sf, "list_state_machines"):
+        for m in p.get("stateMachines", []):
+            s.add(m["stateMachineArn"], m["name"], "active", {}, m.get("creationDate"))
+
+
+def sc_glue(s):
+    glue = s.client("glue")
+    for p in pages(glue, "get_crawlers"):
+        for c in p.get("Crawlers", []):
+            s.add(s.arn("glue", f"crawler/{c['Name']}"), c["Name"], c.get("State", "READY"),
+                  {}, c.get("CreationTime"))
+    for p in pages(glue, "list_jobs"):
+        for name in p.get("JobNames", []):
+            s.add(s.arn("glue", f"job/{name}"), name, "active", {})
+    try:
+        for p in pages(glue, "get_dev_endpoints"):
+            for e in p.get("DevEndpoints", []):
+                s.add(s.arn("glue", f"devEndpoint/{e['EndpointName']}"), e["EndpointName"],
+                      e.get("Status"), {}, e.get("CreatedTimestamp"))
+    except Exception as exc:
+        log(f"[WARN] {s.region} Glue dev endpoints: {short(exc)}", True)
+
+
+def sc_apigateway(s):
+    ag = s.client("apigateway")
+    for p in pages(ag, "get_rest_apis"):
+        for a in p.get("items", []):
+            s.add(f"arn:{s.partition}:apigateway:{s.region}::/restapis/{a['id']}",
+                  a.get("name"), "active", tags_of(a.get("tags")), a.get("createdDate"),
+                  kind="restapi", rid=a["id"])
+    try:
+        v2 = s.client("apigatewayv2")
+        token = None
+        while True:
+            r = v2.get_apis(**({"NextToken": token} if token else {}))
+            for a in r.get("Items", []):
+                s.add(f"arn:{s.partition}:apigateway:{s.region}::/apis/{a['ApiId']}",
+                      a.get("Name"), "active", tags_of(a.get("Tags")), a.get("CreatedDate"),
+                      kind="httpapi", rid=a["ApiId"])
+            token = r.get("NextToken")
+            if not token:
+                break
+    except Exception as exc:
+        log(f"[WARN] {s.region} API Gateway v2: {short(exc)}", True)
+
+
+def sc_efs(s):
+    efs = s.client("efs")
+    for p in pages(efs, "describe_file_systems"):
+        for f in p.get("FileSystems", []):
+            s.add(f["FileSystemArn"], f.get("Name") or f["FileSystemId"],
+                  f.get("LifeCycleState"), tags_of(f.get("Tags")), f.get("CreationTime"))
+
+
+def sc_kinesis(s):
+    k = s.client("kinesis")
+    for p in pages(k, "list_streams"):
+        for name in p.get("StreamNames", []):
+            d = k.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]
+            s.add(d["StreamARN"], name, d.get("StreamStatus"), {},
+                  d.get("StreamCreationTimestamp"))
+
+
+def sc_classic_elb(s):
+    elb = s.client("elb")
+    for p in pages(elb, "describe_load_balancers"):
+        for lb in p.get("LoadBalancerDescriptions", []):
+            n = lb["LoadBalancerName"]
+            s.add(s.arn("elasticloadbalancing", f"loadbalancer/{n}"), n, "active", {},
+                  lb.get("CreatedTime"))
+
+
+def sc_sagemaker_extra(s):
+    sm = s.client("sagemaker")
+    try:
+        for p in pages(sm, "list_domains"):
+            for d in p.get("Domains", []):
+                s.add(d["DomainArn"], d.get("DomainName"), d.get("Status"), {},
+                      d.get("CreationTime"))
+    except Exception as exc:
+        log(f"[WARN] {s.region} SageMaker domains: {short(exc)}", True)
+    try:
+        for p in pages(sm, "list_apps"):
+            for a in p.get("Apps", []):
+                if a.get("Status") in ("Deleted", "Deleting"):
+                    continue
+                owner = a.get("UserProfileName") or a.get("SpaceName") or "-"
+                s.add(s.arn("sagemaker", f"app/{a['DomainId']}/{owner}/{a['AppType']}/"
+                                         f"{a['AppName']}"),
+                      f"{a['AppType']}/{a['AppName']}", a.get("Status"), {},
+                      a.get("CreationTime"), kind="app")
+    except Exception as exc:
+        log(f"[WARN] {s.region} SageMaker apps: {short(exc)}", True)
+    for op, key, arn_key, name_key in (
+            ("list_training_jobs", "TrainingJobSummaries", "TrainingJobArn", "TrainingJobName"),
+            ("list_processing_jobs", "ProcessingJobSummaries", "ProcessingJobArn",
+             "ProcessingJobName")):
+        try:
+            for p in pages(sm, op, StatusEquals="InProgress"):
+                for j in p.get(key, []):
+                    s.add(j[arn_key], j[name_key], "running", {}, j.get("CreationTime"))
+        except Exception as exc:
+            log(f"[WARN] {s.region} SageMaker {op}: {short(exc)}", True)
+
+
+def sc_bedrock_extra(s):
+    br = s.client("bedrock")
+    try:
+        for p in pages(br, "list_inference_profiles", typeEquals="APPLICATION"):
+            for ip in p.get("inferenceProfileSummaries", []):
+                s.add(ip["inferenceProfileArn"], ip.get("inferenceProfileName"),
+                      ip.get("status"), {}, ip.get("createdAt"))
+    except Exception as exc:
+        log(f"[WARN] {s.region} Bedrock inference profiles: {short(exc)}", True)
+    ba = s.client("bedrock-agent")
+    for op, key, label in (("list_flows", "flowSummaries", "flows"),
+                           ("list_prompts", "promptSummaries", "prompts")):
+        try:
+            for p in pages(ba, op):
+                for x in p.get(key, []):
+                    s.add(x["arn"], x.get("name"), x.get("status") or "active", {},
+                          x.get("createdAt"))
+        except Exception as exc:
+            log(f"[WARN] {s.region} Bedrock {label}: {short(exc)}", True)
+
+
+def sc_cloudwatch(s):
+    cw = s.client("cloudwatch")
+    for p in pages(cw, "describe_alarms", AlarmTypes=["MetricAlarm", "CompositeAlarm"]):
+        for a in (p.get("MetricAlarms", []) + p.get("CompositeAlarms", [])):
+            s.add(a["AlarmArn"], a["AlarmName"], "active", {},
+                  a.get("AlarmConfigurationUpdatedTimestamp"))
+    for p in pages(cw, "list_dashboards"):
+        for d in p.get("DashboardEntries", []):
+            s.add(d["DashboardArn"], d["DashboardName"], "active", {}, d.get("LastModified"))
+
+
+def sc_msk(s):
+    k = s.client("kafka")
+    for p in pages(k, "list_clusters_v2"):
+        for c in p.get("ClusterInfoList", []):
+            s.add(c["ClusterArn"], c["ClusterName"], c.get("State"), tags_of(c.get("Tags")),
+                  c.get("CreationTime"))
+
+
+def sc_mq(s):
+    mq = s.client("mq")
+    for p in pages(mq, "list_brokers"):
+        for b in p.get("BrokerSummaries", []):
+            s.add(b["BrokerArn"], b.get("BrokerName"), b.get("BrokerState"), {},
+                  b.get("Created"))
+
+
+def sc_transfer(s):
+    tr = s.client("transfer")
+    for p in pages(tr, "list_servers"):
+        for sv in p.get("Servers", []):
+            s.add(sv["Arn"], sv["ServerId"], sv.get("State"), {})
+
+
+def sc_cloudfront(s):
+    cf = s.client("cloudfront")
+    for p in pages(cf, "list_distributions"):
+        for d in (p.get("DistributionList") or {}).get("Items") or []:
+            s.add(d["ARN"], d.get("DomainName") or d["Id"], d.get("Status"), {},
+                  d.get("LastModifiedTime"), rid=d["Id"])
+
+
+def sc_route53(s):
+    r53 = s.client("route53")
+    for p in pages(r53, "list_hosted_zones"):
+        for z in p.get("HostedZones", []):
+            zid = z["Id"].split("/")[-1]
+            s.add(f"arn:{s.partition}:route53:::hostedzone/{zid}", z["Name"].rstrip("."),
+                  "active", {}, kind="hostedzone", rid=zid)
+
+
 SCANNERS = [
-    ("EC2/EBS/NAT/EIP", sc_ec2), ("RDS", sc_rds), ("Lambda", sc_lambda), ("EKS", sc_eks),
-    ("ECS", sc_ecs), ("ELBv2", sc_elbv2), ("DynamoDB", sc_dynamodb),
-    ("ElastiCache", sc_elasticache), ("OpenSearch", sc_opensearch),
-    ("SageMaker", sc_sagemaker), ("Bedrock", sc_bedrock), ("CloudWatch Logs", sc_logs),
-    ("Secrets Manager", sc_secrets), ("Redshift", sc_redshift), ("ECR", sc_ecr),
+    ("EC2/EBS/NAT/EIP/AMI", sc_ec2), ("RDS", sc_rds), ("Lambda", sc_lambda), ("EKS", sc_eks),
+    ("ECS", sc_ecs), ("ELBv2", sc_elbv2), ("Classic ELB", sc_classic_elb),
+    ("DynamoDB", sc_dynamodb), ("ElastiCache", sc_elasticache),
+    ("OpenSearch", sc_opensearch), ("SageMaker", sc_sagemaker),
+    ("SageMaker Studio/jobs", sc_sagemaker_extra), ("Bedrock", sc_bedrock),
+    ("Bedrock extras", sc_bedrock_extra), ("CloudWatch Logs", sc_logs),
+    ("CloudWatch alarms/dashboards", sc_cloudwatch), ("Secrets Manager", sc_secrets),
+    ("Redshift", sc_redshift), ("ECR", sc_ecr), ("SQS", sc_sqs), ("SNS", sc_sns),
+    ("KMS", sc_kms), ("Step Functions", sc_stepfunctions), ("Glue", sc_glue),
+    ("API Gateway", sc_apigateway), ("EFS", sc_efs), ("Kinesis", sc_kinesis),
+    ("MSK", sc_msk), ("Amazon MQ", sc_mq), ("Transfer Family", sc_transfer),
 ]
 
+# Global services (billed under region "global"): scanned once via us-east-1
+GLOBAL_SCANNERS = [("CloudFront", sc_cloudfront), ("Route 53", sc_route53)]
+GLOBAL_REGIONS = ("global", "NoRegion")
 
-def merge_tagging_api(s):
+
+def merge_tagging_api(s, only_services=None):
     """Fill tags on scanned resources and add any other tagged resource."""
     tg = s.client("resourcegroupstaggingapi")
     added = 0
@@ -515,6 +751,8 @@ def merge_tagging_api(s):
                     s.items[arn]["Tags"] = tags
                 continue
             svc, _, kind, rid = parse_arn(arn)
+            if only_services and svc not in only_services:
+                continue
             if svc == "ec2" and kind not in BILLABLE_EC2:
                 continue
             s.add(arn, tags.get("Name") or rid, "unknown", tags)
@@ -543,6 +781,27 @@ def scan_region(profile, region, acct, partition):
         log(f"[WARN] {region} tagging API failed (tags may be incomplete): {short(exc)}")
     log(f"[Inventory] {region}: {len(s.items)} resources")
     return list(s.items.values())
+
+
+def scan_global(profile, acct, partition):
+    """CloudFront / Route 53 live outside regions; scan once and file under 'global'."""
+    session = boto3.Session(profile_name=profile, region_name="us-east-1")
+    s = Scan(session, "us-east-1", acct, partition)
+    log("[Inventory] global services: scanning...")
+    for name, fn in GLOBAL_SCANNERS:
+        try:
+            fn(s)
+        except Exception as exc:
+            log(f"[WARN] global {name}: {short(exc)}")
+    try:
+        merge_tagging_api(s, only_services={"cloudfront", "route53"})
+    except Exception as exc:
+        log(f"[WARN] global tagging API failed (tags may be incomplete): {short(exc)}")
+    items = list(s.items.values())
+    for it in items:
+        it["Region"] = "global"
+    log(f"[Inventory] global: {len(items)} resources")
+    return items
 
 
 def scan_s3(session, home_region, acct, target_regions):
@@ -597,13 +856,14 @@ def merge_items(batches):
 def assign_cost_services(items, costs):
     by_region = defaultdict(list)
     for (region, svc), c in costs.items():
-        by_region[region].append((svc, c))
+        by_region[region].append((svc, c, region))
     for it in items:
+        regs = list(GLOBAL_REGIONS) if it["Region"] in GLOBAL_REGIONS else [it["Region"]]
+        pool = [x for r in regs for x in by_region.get(r, [])]
         for key in cost_keys_for(it["Svc"], it["Kind"]):
-            cands = [(c, svc) for svc, c in by_region.get(it["Region"], [])
-                     if key in svc.lower()]
+            cands = [(c, svc, r) for svc, c, r in pool if key in svc.lower()]
             if cands:
-                it["CostService"] = max(cands)[1]
+                _, it["CostService"], it["Region"] = max(cands)
                 break
 
 
@@ -685,8 +945,9 @@ def lookup_creator(ct, it, start, end, pacer, max_pages):
 
 
 def creators_for_region(profile, region, its, start, end, budget, max_pages):
-    session = boto3.Session(profile_name=profile, region_name=region)
-    ct = get_client(session, "cloudtrail", region)
+    api_region = "us-east-1" if region in GLOBAL_REGIONS else region
+    session = boto3.Session(profile_name=profile, region_name=api_region)
+    ct = get_client(session, "cloudtrail", api_region)
     pacer, t0, done = Pacer(), time.monotonic(), 0
     its = sorted(its, key=lambda i: bool(i["Tags"]))   # untagged first
     log(f"[CloudTrail] {region}: looking up {len(its)} resources (budget {budget}s)")
@@ -953,6 +1214,8 @@ def main():
                     log(f"[WARN] scan {futs[f]} failed: {short(exc)}")
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
+        if any(r in GLOBAL_REGIONS for (r, _) in costs):
+            batches.append(scan_global(args.profile, acct, partition))
         batches.append(scan_s3(session, args.region, acct, set(regions)))
         items = merge_items(batches)
         assign_cost_services(items, costs)
@@ -974,6 +1237,12 @@ def main():
     summary, details, untagged, usage_rows = build_report(
         costs, usage, items, args.ascending, required_tags)
     print_console_summary(summary)
+    no_res = [r for r in summary if r["Resources Found"] == 0]
+    if no_res:
+        log("\nBilled but NO resources found (usage-based, already deleted, or a service "
+            "this script does not scan - check manually):")
+        for r in no_res:
+            log(f"   {r['Region']:<16}{r['Service'][:60]:<62}${r['Cost (USD)']:,.2f}")
     write_excel(args.output, [
         ("Region-Service Summary", summary),
         ("Resource Details", details),
