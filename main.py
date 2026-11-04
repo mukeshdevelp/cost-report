@@ -1,32 +1,42 @@
 #!/usr/bin/env python3
 """
-AWS Cost + IAM Resource Audit  (hang-resistant version)
+AWS Cleanup Audit  (cost-first, tag-focused)
 
-Key differences from the previous version:
-  * Every boto3 client has short connect/read timeouts (nothing can block forever).
-  * Output is flushed immediately and each discovered resource is printed live.
-  * Resource inventory runs FIRST so you see resources before anything slow starts.
-  * CloudTrail scans only the regions that actually hold resources (or --all-regions),
-    in parallel, with a per-region time budget and page cap.
-  * "AssumeRole" was removed from the CloudTrail target list (it generates thousands of
-    events and was the main cause of the apparent hang; it also can't be mapped to a resource).
-  * Lambda event names fixed (CloudTrail logs them as CreateFunction20150331 etc).
-  * Ctrl+C no longer kills the run: whatever was collected so far is written to Excel.
+Goal: find billed resources that are not tagged, and show who created them.
 
-Usage:
-  python aws_cost_iam_audit.py -v
-  python aws_cost_iam_audit.py -v --skip-cloudtrail        # fastest sanity check
-  python aws_cost_iam_audit.py --debug                     # botocore request logging
+Flow
+  1. Cost Explorer (billing) -> every Region + Service that actually has cost > 0.
+     Credits / refunds / tax are excluded, so credits do not hide real usage.
+  2. Only the regions that have cost are scanned for resources:
+        - Resource Groups Tagging API (every taggable resource that has/had tags)
+        - Service scanners (catch UNTAGGED resources the tagging API cannot see):
+          EC2/EBS/snapshots/NAT/EIP/VPC endpoints, RDS, S3, Lambda, EKS, ECS, ELBv2,
+          DynamoDB, ElastiCache, OpenSearch, SageMaker, Bedrock (provisioned throughput,
+          custom/imported models, guardrails, agents, knowledge bases), CloudWatch Logs,
+          Secrets Manager, Redshift, ECR
+  3. CloudTrail (last 90 days max) -> IAM user / role session that created each resource.
+  4. Excel report:
+        Region-Service Summary   region -> service -> cost, status counts, creators
+        Resource Details         one row per resource: cost, creator, status, tags
+        Untagged Resources       the cleanup list
+        Usage Breakdown          usage types per service (e.g. which Bedrock model)
+
+Usage
+  python aws_cleanup_audit.py -v
+  python aws_cleanup_audit.py --skip-cloudtrail          # fastest
+  python aws_cleanup_audit.py --ascending                # low -> high cost (default high -> low)
+  python aws_cleanup_audit.py --min-cost 0.01            # ignore services under 1 cent
+  python aws_cleanup_audit.py --required-tags Owner,Environment
 """
 
 import argparse
 import json
-import logging
 import os
 import re
 import sys
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
@@ -35,1111 +45,825 @@ import pandas as pd
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 DEFAULT_PROFILE = "mfa-session"
 DEFAULT_REGION = "ap-south-1"
-DEFAULT_DAYS = 30
+DEFAULT_DAYS = 10
 
 VERBOSE = False
 STOP = threading.Event()
 _print_lock = threading.Lock()
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def log(msg="", verbose_only=False):
-    """Thread-safe, always-flushed print."""
     if verbose_only and not VERBOSE:
         return
     with _print_lock:
         print(msg, flush=True)
 
 
+def short(exc, n=160):
+    return str(exc).replace("\n", " ")[:n]
+
+
 def make_config():
-    return Config(
-        connect_timeout=5,
-        read_timeout=20,
-        retries={"max_attempts": 4, "mode": "adaptive"},
-    )
+    return Config(connect_timeout=5, read_timeout=25,
+                  retries={"max_attempts": 5, "mode": "adaptive"})
 
 
 def get_client(session, service, region=None):
     return session.client(service, region_name=region, config=make_config())
 
 
-# ============================================================
-# CLOUDTRAIL EVENT CONFIGURATION
-# ============================================================
+def pages(client, op, **kw):
+    """Paginate when the API supports it, otherwise a single call."""
+    if client.can_paginate(op):
+        for p in client.get_paginator(op).paginate(**kw):
+            yield p
+    else:
+        yield getattr(client, op)(**kw)
 
-# NOTE: AssumeRole intentionally removed (huge volume, not attributable to a resource).
-TARGET_EVENTS = [
-    "RunInstances",
-    "StartInstances",
-    "StopInstances",
-    "TerminateInstances",
-    "CreateVolume",
-    "CreateDBInstance",
-    "StartDBInstance",
-    "StopDBInstance",
-    "DeleteDBInstance",
-    "CreateBucket",
-    "CreateFunction20150331",
-    "UpdateFunctionConfiguration20150331v2",
-    "CreateCluster",
-    "CreateLoadBalancer",
-]
 
-CREATION_EVENTS = {
-    "EC2": {"RunInstances"},
-    "EBS": {"CreateVolume"},
-    "RDS": {"CreateDBInstance"},
-    "S3": {"CreateBucket"},
-    "Lambda": {"CreateFunction20150331", "CreateFunction"},
-    "EKS": {"CreateCluster"},
-    "ELB": {"CreateLoadBalancer"},
-}
+def tags_of(tag_list):
+    """Accepts [{'Key':..,'Value':..}], [{'key':..,'value':..}] or a dict."""
+    if not tag_list:
+        return {}
+    if isinstance(tag_list, dict):
+        return dict(tag_list)
+    out = {}
+    for t in tag_list:
+        k = t.get("Key", t.get("key"))
+        v = t.get("Value", t.get("value", ""))
+        if k is not None:
+            out[k] = v
+    return out
 
-START_EVENTS = {
-    "EC2": {"StartInstances"},
-    "RDS": {"StartDBInstance"},
-}
 
-SERVICE_EVENT_SOURCES = {
-    "EC2": {"ec2.amazonaws.com"},
-    "EBS": {"ec2.amazonaws.com"},
-    "RDS": {"rds.amazonaws.com"},
-    "S3": {"s3.amazonaws.com"},
-    "Lambda": {"lambda.amazonaws.com"},
-    "EKS": {"eks.amazonaws.com"},
-    "ELB": {"elasticloadbalancing.amazonaws.com"},
-}
+def fmt_dt(v):
+    if v is None or v == "":
+        return ""
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return str(v)
 
-RESOURCE_IDENTIFIER_KEYS = {
-    "EC2": {"instanceid"},
-    "EBS": {"volumeid"},
-    "RDS": {"dbinstanceidentifier"},
-    "S3": {"bucketname"},
-    "Lambda": {"functionname", "functionarn"},
-    "EKS": {"name", "clustername", "clusterarn"},
-    "ELB": {"loadbalancername", "loadbalancerarn"},
-}
+
+def parse_arn(arn):
+    """-> (service, region, resource_type, resource_id)"""
+    p = arn.split(":", 5)
+    if len(p) < 6:
+        return "", "", "", arn
+    service, region, res = p[2], p[3], p[5]
+    m = re.match(r"([^/:]+)[/:](.+)", res)
+    rtype, rid = (m.group(1), m.group(2)) if m else ("", res)
+    return service, region, rtype, rid
 
 
 # ============================================================
-# AWS SESSION
+# STATUS NORMALISATION
 # ============================================================
 
-def create_session(profile, region):
-    session = boto3.Session(profile_name=profile, region_name=region)
-    log(f"Using profile '{profile}', region '{region}'. Checking credentials...")
-    identity = get_client(session, "sts", region).get_caller_identity()
-    log(f"AWS Account: {identity['Account']}")
-    log(f"Caller ARN:  {identity['Arn']}")
-    return session, identity
+ACTIVE = {"running", "available", "in-use", "in_use", "active", "inservice", "in_service",
+          "ready", "completed", "enabled", "associated", "healthy", "attached", "normal",
+          "succeeded", "valid", "issued"}
+PENDING = {"pending", "creating", "starting", "provisioning", "initializing", "updating",
+           "modifying", "backing-up", "upgrading", "rebooting", "in_progress", "inprogress",
+           "processing", "importing", "scaling", "renaming", "configuring-enhanced-monitoring",
+           "storage-optimization", "resetting-master-credentials", "pending-update"}
+INACTIVE = {"stopped", "stopping", "inactive", "disabled", "stopped-by-aws"}
+BAD = {"deleting", "deleted", "failed", "error", "terminated", "shutting-down",
+       "create_failed", "delete_failed", "active_impaired", "unhealthy"}
+
+
+def normalize_status(raw):
+    s = (raw or "").lower().strip()
+    if not s or s == "unknown":
+        return "Unknown"
+    if "unattached" in s or "unassociated" in s:
+        return "Idle / Unattached"
+    if s in ACTIVE:
+        return "Active"
+    if s in PENDING:
+        return "Pending / Initializing"
+    if s in INACTIVE:
+        return "Inactive / Stopped"
+    if s in BAD:
+        return "Deleting / Failed"
+    return "Unknown"
+
+
+# ============================================================
+# BILLING NAME <-> RESOURCE MAPPING
+# ============================================================
+# Lower-case substrings of the Cost Explorer service name, by ARN service.
+
+SERVICE_COST_KEYS = {
+    "lambda": ["lambda"],
+    "s3": ["simple storage service"],
+    "rds": ["relational database"],
+    "dynamodb": ["dynamodb"],
+    "eks": ["kubernetes"],
+    "ecs": ["elastic container service", "container service"],
+    "ecr": ["container registry"],
+    "elasticloadbalancing": ["elastic load balancing"],
+    "bedrock": ["bedrock"],
+    "sagemaker": ["sagemaker"],
+    "es": ["opensearch", "elasticsearch"],
+    "aoss": ["opensearch"],
+    "elasticache": ["elasticache"],
+    "redshift": ["redshift"],
+    "logs": ["cloudwatch"],
+    "cloudwatch": ["cloudwatch"],
+    "secretsmanager": ["secrets manager"],
+    "kms": ["key management"],
+    "sqs": ["queue service"],
+    "sns": ["notification service"],
+    "cloudfront": ["cloudfront"],
+    "states": ["step functions"],
+    "glue": ["glue"],
+    "athena": ["athena"],
+    "kinesis": ["kinesis"],
+    "apigateway": ["api gateway"],
+    "elasticfilesystem": ["elastic file system"],
+    "ssm": ["systems manager"],
+}
+
+BILLABLE_EC2 = {"instance", "volume", "snapshot", "natgateway", "elastic-ip",
+                "vpc-endpoint", "image"}
+
+
+def cost_keys_for(svc, kind):
+    if svc == "ec2":
+        if kind == "instance":
+            return ["elastic compute cloud - compute", "ec2 - other"]
+        if kind in ("elastic-ip", "vpc-endpoint"):
+            return ["virtual private cloud", "ec2 - other"]
+        return ["ec2 - other", "virtual private cloud"]
+    return SERVICE_COST_KEYS.get(svc) or [svc]
 
 
 # ============================================================
 # COST EXPLORER
 # ============================================================
 
-def get_cost_amount(metrics):
-    metric = metrics.get("UnblendedCost", {})
-    return {
-        "Cost": float(metric.get("Amount", 0)),
-        "Currency": metric.get("Unit", "USD"),
+COST_FILTER = {"Not": {"Dimensions": {"Key": "RECORD_TYPE",
+                                      "Values": ["Credit", "Refund", "Tax"]}}}
+
+
+def ce_query(ce, start, end, dims):
+    params = {
+        "TimePeriod": {"Start": start, "End": end},
+        "Granularity": "MONTHLY",
+        "Metrics": ["UnblendedCost"],
+        "GroupBy": [{"Type": "DIMENSION", "Key": d} for d in dims],
+        "Filter": COST_FILTER,
     }
+    out = defaultdict(float)
+    while True:
+        resp = ce.get_cost_and_usage(**params)
+        for period in resp.get("ResultsByTime", []):
+            for g in period.get("Groups", []):
+                out[tuple(g["Keys"])] += float(g["Metrics"]["UnblendedCost"]["Amount"])
+        token = resp.get("NextPageToken")
+        if not token:
+            break
+        params["NextPageToken"] = token
+    return out
 
 
-def get_cost_data(ce, start_date, end_date, granularity, group_by, sheet_name):
-    rows = []
+def get_costs(ce, start, end, min_cost):
+    log("\n[Billing] Cost by region + service (credits/refunds/tax excluded)...")
+    raw = ce_query(ce, start, end, ["REGION", "SERVICE"])
+    costs = {k: round(v, 4) for k, v in raw.items() if round(v, 4) > min_cost}
+    log(f"   {len(costs)} region/service pairs with cost > ${min_cost}")
+
+    usage = defaultdict(list)
     try:
-        params = {
-            "TimePeriod": {"Start": start_date, "End": end_date},
-            "Granularity": granularity,
-            "Metrics": ["UnblendedCost"],
-            "GroupBy": group_by,
+        raw_u = ce_query(ce, start, end, ["REGION", "SERVICE", "USAGE_TYPE"])
+        for (region, svc, ut), v in raw_u.items():
+            if round(v, 4) > 0 and (region, svc) in costs:
+                usage[(region, svc)].append((ut, round(v, 4)))
+        for k in usage:
+            usage[k].sort(key=lambda x: x[1], reverse=True)
+    except (ClientError, BotoCoreError) as exc:
+        log(f"[WARNING] Usage-type query failed: {short(exc)}")
+    return costs, usage
+
+
+# ============================================================
+# RESOURCE SCANNING
+# ============================================================
+
+class Scan:
+    def __init__(self, session, region, acct, partition):
+        self.session, self.region = session, region
+        self.acct, self.partition = acct, partition
+        self.items = {}
+
+    def client(self, svc):
+        return get_client(self.session, svc, self.region)
+
+    def arn(self, svc, res, with_account=True):
+        acct = self.acct if with_account else ""
+        return f"arn:{self.partition}:{svc}:{self.region}:{acct}:{res}"
+
+    def add(self, arn, name, state, tags, created=None, kind=None, rid=None):
+        svc, _, rtype, parsed_id = parse_arn(arn)
+        kind = kind or rtype or svc
+        rid = rid or parsed_id
+        self.items[arn] = {
+            "Key": arn, "ARN": arn, "Region": self.region, "Svc": svc, "Kind": kind,
+            "ID": rid, "Name": name or "", "State": state or "unknown",
+            "Tags": tags or {}, "Created": created, "CostService": None,
+            "Attribution": "Not checked", "CreatedBy": "", "PrincipalType": "",
+            "ViaRole": "", "CreatorARN": "", "CreatedAt": "",
         }
-        page = 0
-        while True:
-            if STOP.is_set():
-                break
-            page += 1
-            log(f"   {sheet_name}: requesting page {page}...", verbose_only=True)
-            response = ce.get_cost_and_usage(**params)
 
-            for period in response.get("ResultsByTime", []):
-                time_period = period.get("TimePeriod", {})
-                for group in period.get("Groups", []):
-                    keys = group.get("Keys", [])
-                    cost_info = get_cost_amount(group.get("Metrics", {}))
-                    row = {
-                        "Period Start": time_period.get("Start", ""),
-                        "Period End": time_period.get("End", ""),
-                        "Cost": cost_info["Cost"],
-                        "Currency": cost_info["Currency"],
-                    }
-                    for index, dimension in enumerate(group_by):
-                        row[dimension["Key"]] = (
-                            keys[index] if index < len(keys) else "Unknown"
-                        )
-                    rows.append(row)
 
-            next_token = response.get("NextPageToken")
-            if not next_token:
-                break
-            params["NextPageToken"] = next_token
-
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[ERROR] {sheet_name}: {exc}")
-
-    log(f"   {sheet_name}: {len(rows)} rows")
-    return rows
-
-
-def get_service_cost(ce, start, end):
-    log("\n[Cost 1/5] Service cost...")
-    return get_cost_data(ce, start, end, "MONTHLY",
-                         [{"Type": "DIMENSION", "Key": "SERVICE"}], "Service Cost")
-
-
-def get_daily_cost(ce, start, end):
-    log("[Cost 2/5] Daily cost...")
-    return get_cost_data(ce, start, end, "DAILY",
-                         [{"Type": "DIMENSION", "Key": "SERVICE"}], "Daily Cost")
-
-
-def get_usage_breakdown(ce, start, end):
-    log("[Cost 3/5] Usage breakdown...")
-    return get_cost_data(
-        ce, start, end, "MONTHLY",
-        [{"Type": "DIMENSION", "Key": "SERVICE"},
-         {"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
-        "Usage Breakdown")
-
-
-def get_operation_breakdown(ce, start, end):
-    log("[Cost 4/5] Operation breakdown...")
-    return get_cost_data(
-        ce, start, end, "MONTHLY",
-        [{"Type": "DIMENSION", "Key": "SERVICE"},
-         {"Type": "DIMENSION", "Key": "OPERATION"}],
-        "Operation Breakdown")
-
-
-def get_region_cost(ce, start, end):
-    log("[Cost 5/5] Regional cost...")
-    return get_cost_data(
-        ce, start, end, "MONTHLY",
-        [{"Type": "DIMENSION", "Key": "SERVICE"},
-         {"Type": "DIMENSION", "Key": "REGION"}],
-        "Region Breakdown")
-
-
-def get_cost_forecast(ce):
-    log("[Cost] Forecast...")
-    rows = []
-    today = datetime.now(timezone.utc).date()
-    first_day_next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
-    first_day_following_month = (first_day_next_month + timedelta(days=32)).replace(day=1)
-
-    try:
-        response = ce.get_cost_forecast(
-            TimePeriod={
-                "Start": first_day_next_month.isoformat(),
-                "End": first_day_following_month.isoformat(),
-            },
-            Metric="UNBLENDED_COST",
-            Granularity="MONTHLY",
-        )
-        for item in response.get("ForecastResultsByTime", []):
-            rows.append({
-                "Forecast Start": item.get("TimePeriod", {}).get("Start", ""),
-                "Forecast End": item.get("TimePeriod", {}).get("End", ""),
-                "Estimated Cost": float(item.get("MeanValue", 0)),
-                "Currency": "USD",
-                "Explanation": "AWS Cost Explorer forecast based on historical spending patterns.",
-            })
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[WARNING] Forecast unavailable: {exc}")
-        rows.append({
-            "Forecast Start": "", "Forecast End": "",
-            "Estimated Cost": "", "Currency": "", "Explanation": str(exc),
-        })
-    return rows
-
-
-def explain_usage(usage_rows):
-    explanations = {
-        "BoxUsage": "EC2 instance running hours.",
-        "InstanceUsage": "Compute instance usage.",
-        "EBS:VolumeUsage": "EBS storage consumption.",
-        "EBS:SnapshotUsage": "EBS snapshot storage.",
-        "NatGateway-Hours": "NAT Gateway running hours.",
-        "NatGateway-Bytes": "NAT Gateway data processing.",
-        "DataTransfer": "Data transfer charges.",
-        "TimedStorage": "S3 storage consumption.",
-        "Requests": "API or storage request charges.",
-        "RDS:InstanceUsage": "RDS database running hours.",
-        "RDS:StorageUsage": "RDS database storage.",
-        "Lambda-GB-Second": "Lambda execution duration and memory.",
-        "Lambda-Requests": "Lambda invocation requests.",
-        "Fargate-vCPU-Hours": "Fargate vCPU consumption.",
-        "Fargate-GB-Hours": "Fargate memory consumption.",
-    }
-    result = []
-    for row in usage_rows:
-        usage_type = row.get("USAGE_TYPE", "")
-        explanation = "Check the AWS usage type and pricing dimension."
-        for key, value in explanations.items():
-            if key.lower() in usage_type.lower():
-                explanation = value
-                break
-        result.append({
-            "Service": row.get("SERVICE", ""),
-            "Usage Type": usage_type,
-            "Month": row.get("Period Start", ""),
-            "Cost": row.get("Cost", 0),
-            "Currency": row.get("Currency", ""),
-            "Possible Cost Reason": explanation,
-        })
-    return result
-
-
-# ============================================================
-# RESOURCE INVENTORY  (prints every resource as it is found)
-# ============================================================
-
-def get_current_resources(session, region):
-    log(f"\n[Inventory] Scanning resources in {region} ...")
-    resources = []
-
-    def add_resource(service, resource_type, resource_id, name, state,
-                     created, tags=None, resource_region=None):
-        tags = tags or {}
-        resources.append({
-            "Service": service,
-            "Resource Type": resource_type,
-            "Resource ID": resource_id or "",
-            "Name": name or "",
-            "State": state or "",
-            "Created At": created or "",
-            "Owner Tag": (tags.get("Owner") or tags.get("owner")
-                          or tags.get("CreatedBy") or ""),
-            "Environment Tag": (tags.get("Environment")
-                                or tags.get("environment") or ""),
-            "Region": resource_region or region,
-        })
-        log(f"   + {service:<7} {resource_type:<14} {resource_id or '-'}  "
-            f"[{state or '-'}]  {name or ''}")
-
-    def step(label):
-        log(f"-> {label} ...")
-        return time.monotonic()
-
-    def done(label, t0, count_before):
-        log(f"   {label}: {len(resources) - count_before} found "
-            f"({time.monotonic() - t0:.1f}s)")
-
-    # ---- EC2 + EBS ----
-    t0, n0 = step("EC2 instances"), len(resources)
-    try:
-        ec2 = get_client(session, "ec2", region)
-        for page in ec2.get_paginator("describe_instances").paginate():
-            for reservation in page.get("Reservations", []):
-                for instance in reservation.get("Instances", []):
-                    tags = {i["Key"]: i["Value"] for i in instance.get("Tags", [])}
-                    add_resource("EC2", "Instance", instance.get("InstanceId"),
-                                 tags.get("Name", ""),
-                                 instance.get("State", {}).get("Name", ""),
-                                 instance.get("LaunchTime"), tags)
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[WARNING] EC2 scan: {exc}")
-    done("EC2", t0, n0)
-
-    t0, n0 = step("EBS volumes"), len(resources)
-    try:
-        for page in ec2.get_paginator("describe_volumes").paginate():
-            for volume in page.get("Volumes", []):
-                tags = {i["Key"]: i["Value"] for i in volume.get("Tags", [])}
-                add_resource("EBS", "Volume", volume.get("VolumeId"),
-                             tags.get("Name", ""), volume.get("State", ""),
-                             volume.get("CreateTime"), tags)
-    except (ClientError, BotoCoreError, UnboundLocalError) as exc:
-        log(f"[WARNING] EBS scan: {exc}")
-    done("EBS", t0, n0)
-
-    # ---- RDS ----
-    t0, n0 = step("RDS instances"), len(resources)
-    try:
-        rds = get_client(session, "rds", region)
-        for page in rds.get_paginator("describe_db_instances").paginate():
-            for db in page.get("DBInstances", []):
-                tags = {}
-                arn = db.get("DBInstanceArn")
-                if arn:
-                    try:
-                        resp = rds.list_tags_for_resource(ResourceName=arn)
-                        tags = {i["Key"]: i["Value"] for i in resp.get("TagList", [])}
-                    except (ClientError, BotoCoreError) as tag_exc:
-                        log(f"[WARNING] RDS tags: {tag_exc}")
-                ident = db.get("DBInstanceIdentifier", "")
-                add_resource("RDS", "DB Instance", ident, ident,
-                             db.get("DBInstanceStatus", ""),
-                             db.get("InstanceCreateTime"), tags)
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[WARNING] RDS scan: {exc}")
-    done("RDS", t0, n0)
-
-    # ---- S3 ----
-    t0, n0 = step("S3 buckets"), len(resources)
-    try:
-        s3_clients = {}
-
-        def s3_for(r):
-            if r not in s3_clients:
-                s3_clients[r] = get_client(session, "s3", r)
-            return s3_clients[r]
-
-        buckets = s3_for(region).list_buckets().get("Buckets", [])
-        log(f"   {len(buckets)} buckets listed; reading region/tags for each...")
-        for bucket in buckets:
-            if STOP.is_set():
-                break
-            name = bucket.get("Name")
-            bucket_region = "us-east-1"
-            try:
-                loc = s3_for(region).get_bucket_location(Bucket=name).get("LocationConstraint")
-                if loc:
-                    bucket_region = "eu-west-1" if loc == "EU" else loc
-            except (ClientError, BotoCoreError) as exc:
-                log(f"[WARNING] S3 region ({name}): {exc}", verbose_only=True)
-
-            tags = {}
-            try:
-                resp = s3_for(bucket_region).get_bucket_tagging(Bucket=name)
-                tags = {i["Key"]: i["Value"] for i in resp.get("TagSet", [])}
-            except ClientError as tag_exc:
-                code = tag_exc.response.get("Error", {}).get("Code", "")
-                if code not in {"NoSuchTagSet", "NoSuchTagSetError"}:
-                    log(f"[WARNING] S3 tags ({name}): {code}", verbose_only=True)
-            except BotoCoreError as tag_exc:
-                log(f"[WARNING] S3 tags ({name}): {tag_exc}", verbose_only=True)
-
-            add_resource("S3", "Bucket", name, name, "Active",
-                         bucket.get("CreationDate"), tags, bucket_region)
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[WARNING] S3 scan: {exc}")
-    done("S3", t0, n0)
-
-    # ---- Lambda ----
-    t0, n0 = step("Lambda functions"), len(resources)
-    try:
-        lam = get_client(session, "lambda", region)
-        for page in lam.get_paginator("list_functions").paginate():
-            for fn in page.get("Functions", []):
-                arn = fn.get("FunctionArn")
-                tags = {}
-                if arn:
-                    try:
-                        tags = lam.list_tags(Resource=arn).get("Tags", {})
-                    except (ClientError, BotoCoreError) as tag_exc:
-                        log(f"[WARNING] Lambda tags: {tag_exc}", verbose_only=True)
-                add_resource("Lambda", "Function", arn, fn.get("FunctionName"),
-                             fn.get("State", "Active"), fn.get("LastModified"), tags)
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[WARNING] Lambda scan: {exc}")
-    done("Lambda", t0, n0)
-
-    # ---- EKS ----
-    t0, n0 = step("EKS clusters"), len(resources)
-    try:
-        eks = get_client(session, "eks", region)
-        for page in eks.get_paginator("list_clusters").paginate():
-            for cluster_name in page.get("clusters", []):
-                cluster = eks.describe_cluster(name=cluster_name)["cluster"]
-                add_resource("EKS", "Cluster", cluster.get("arn"), cluster_name,
-                             cluster.get("status", ""), cluster.get("createdAt"),
-                             cluster.get("tags", {}))
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[WARNING] EKS scan: {exc}")
-    done("EKS", t0, n0)
-
-    # ---- ELBv2 ----
-    t0, n0 = step("Load balancers"), len(resources)
-    try:
-        elb = get_client(session, "elbv2", region)
-        for page in elb.get_paginator("describe_load_balancers").paginate():
-            for lb in page.get("LoadBalancers", []):
-                arn = lb.get("LoadBalancerArn")
-                tags = {}
-                if arn:
-                    try:
-                        resp = elb.describe_tags(ResourceArns=[arn])
-                        tag_list = resp.get("TagDescriptions", [])
-                        if tag_list:
-                            tags = {i["Key"]: i["Value"]
-                                    for i in tag_list[0].get("Tags", [])}
-                    except (ClientError, BotoCoreError) as tag_exc:
-                        log(f"[WARNING] ELB tags: {tag_exc}", verbose_only=True)
-                add_resource("ELB", "Load Balancer", arn, lb.get("LoadBalancerName"),
-                             lb.get("State", {}).get("Code", ""),
-                             lb.get("CreatedTime", ""), tags)
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[WARNING] ELB scan: {exc}")
-    done("ELB", t0, n0)
-
-    # ---- Summary ----
-    log(f"\n[Inventory] Total resources found: {len(resources)}")
-    summary = {}
-    for r in resources:
-        summary[r["Service"]] = summary.get(r["Service"], 0) + 1
-    for svc, cnt in sorted(summary.items()):
-        log(f"   {svc:<8} {cnt}")
-
-    return resources
-
-
-# ============================================================
-# CLOUDTRAIL PRINCIPAL / RESOURCE EXTRACTION
-# ============================================================
-
-def normalize_key(value):
-    return re.sub(r"[^a-z0-9]", "", str(value).lower())
-
-
-def extract_principal(event):
-    identity = event.get("userIdentity", {})
-    identity_type = identity.get("type", "Unknown")
-    principal_arn = identity.get("arn", "")
-    principal_id = identity.get("principalId", "")
-    user_name = identity.get("userName", "")
-
-    issuer = identity.get("sessionContext", {}).get("sessionIssuer", {})
-    issuer_arn = issuer.get("arn", "")
-    issuer_name = issuer.get("userName", "")
-    session_name = ""
-
-    if identity_type == "IAMUser":
-        principal_name = user_name or principal_arn.split("/")[-1]
-        principal_type = "IAM User"
-    elif identity_type == "AssumedRole":
-        arn_parts = principal_arn.split("/")
-        session_name = arn_parts[-1] if len(arn_parts) >= 3 else ""
-        principal_name = issuer_name or (
-            issuer_arn.split("/")[-1] if issuer_arn
-            else (arn_parts[-2] if len(arn_parts) >= 2 else "Unknown Role")
-        )
-        principal_type = "Assumed IAM Role"
-    elif identity_type == "Root":
-        principal_name = "Root"
-        principal_type = "Root Account"
-    elif identity_type == "AWSService":
-        principal_name = identity.get("invokedBy", principal_arn or "AWS Service")
-        principal_type = "AWS Service"
-    else:
-        principal_name = user_name or principal_arn or principal_id or "Unknown"
-        principal_type = identity_type
-
-    return {
-        "Principal Name": principal_name,
-        "Principal Type": principal_type,
-        "Principal ARN": principal_arn,
-        "Principal ID": principal_id,
-        "Session Issuer ARN": issuer_arn,
-        "Session Issuer Name": issuer_name,
-        "Session Name": session_name,
-    }
-
-
-def collect_service_identifiers(data, allowed_keys, values=None):
-    if values is None:
-        values = set()
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if (normalize_key(key) in allowed_keys
-                    and isinstance(value, str) and value.strip()):
-                values.add(value.strip())
-            if isinstance(value, (dict, list)):
-                collect_service_identifiers(value, allowed_keys, values)
-    elif isinstance(data, list):
-        for item in data:
-            collect_service_identifiers(item, allowed_keys, values)
-    return values
-
-
-def detect_event_service(event):
-    source = event.get("eventSource", "")
-    event_name = event.get("eventName", "")
-    if source == "ec2.amazonaws.com":
-        return "EBS" if event_name == "CreateVolume" else "EC2"
-    return {
-        "rds.amazonaws.com": "RDS",
-        "s3.amazonaws.com": "S3",
-        "lambda.amazonaws.com": "Lambda",
-        "eks.amazonaws.com": "EKS",
-        "elasticloadbalancing.amazonaws.com": "ELB",
-    }.get(source, "")
-
-
-def extract_event_resource_keys(event, service):
-    allowed_keys = RESOURCE_IDENTIFIER_KEYS.get(service, set())
-    values = set()
-    collect_service_identifiers(event.get("requestParameters") or {}, allowed_keys, values)
-    collect_service_identifiers(event.get("responseElements") or {}, allowed_keys, values)
-    for item in event.get("resources") or []:
-        resource_name = item.get("resourceName")
-        if isinstance(resource_name, str) and resource_name.strip():
-            values.add(resource_name.strip())
-    return values
-
-
-def get_resource_match_keys(resource):
-    service = resource.get("Service", "")
-    keys = set()
-    resource_id = resource.get("Resource ID")
-    if resource_id:
-        keys.add(str(resource_id).strip())
-    if service in {"S3", "Lambda", "EKS", "ELB", "RDS"}:
-        resource_name = resource.get("Name")
-        if resource_name:
-            keys.add(str(resource_name).strip())
-    return keys
-
-
-# ============================================================
-# CLOUDTRAIL SCANNING (bounded, parallel across regions)
-# ============================================================
-
-def get_enabled_regions(session, fallback_region):
-    try:
-        response = get_client(session, "ec2", fallback_region).describe_regions(AllRegions=False)
-        regions = [r["RegionName"] for r in response.get("Regions", [])]
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[WARNING] Could not list regions: {exc}")
-        regions = [fallback_region]
-    return sorted(set(regions or [fallback_region]))
-
-
-def parse_event(item, event_name, region):
-    try:
-        event = json.loads(item.get("CloudTrailEvent", "{}"))
-    except (json.JSONDecodeError, TypeError):
-        return None
-    service = detect_event_service(event)
-    principal = extract_principal(event)
-    resource_keys = extract_event_resource_keys(event, service) if service else set()
-    return {
-        "Event Time": event.get("eventTime", item.get("EventTime")),
-        "Event Name": event.get("eventName", event_name),
-        "AWS Service": event.get("eventSource", ""),
-        "Detected Service": service,
-        "AWS Region": event.get("awsRegion", region),
-        "Principal Name": principal["Principal Name"],
-        "Principal Type": principal["Principal Type"],
-        "Principal ARN": principal["Principal ARN"],
-        "Principal ID": principal["Principal ID"],
-        "Session Issuer ARN": principal["Session Issuer ARN"],
-        "Session Issuer Name": principal["Session Issuer Name"],
-        "Session Name": principal["Session Name"],
-        "Source IP": event.get("sourceIPAddress", ""),
-        "User Agent": event.get("userAgent", ""),
-        "CloudTrail Event ID": event.get("eventID", item.get("EventId", "")),
-        "Read Only": event.get("readOnly", ""),
-        "_resource_keys": resource_keys,
-    }
-
-
-def scan_cloudtrail_region(client, region, start_time, end_time, budget, max_pages):
-    """Scan one region. Stops when the time budget or page cap is reached."""
-    rows = []
-    t0 = time.monotonic()
-    last_call = 0.0
-    log(f"[CloudTrail] {region}: started (budget {budget}s)")
-
-    for event_name in TARGET_EVENTS:
-        if STOP.is_set():
-            break
-        if time.monotonic() - t0 > budget:
-            log(f"[CloudTrail] {region}: time budget reached, skipping remaining events")
-            break
-
-        token, pages, count = None, 0, 0
-        while pages < max_pages:
-            if STOP.is_set() or time.monotonic() - t0 > budget:
-                break
-
-            # LookupEvents is limited to ~2 requests/sec per region
-            wait = 0.6 - (time.monotonic() - last_call)
-            if wait > 0:
-                time.sleep(wait)
-
-            kwargs = {
-                "LookupAttributes": [{"AttributeKey": "EventName",
-                                      "AttributeValue": event_name}],
-                "StartTime": start_time,
-                "EndTime": end_time,
-                "MaxResults": 50,
-            }
-            if token:
-                kwargs["NextToken"] = token
-
-            try:
-                resp = client.lookup_events(**kwargs)
-            except (ClientError, BotoCoreError) as exc:
-                log(f"[WARNING] CloudTrail {region} {event_name}: {exc}")
-                break
-            last_call = time.monotonic()
-            pages += 1
-
-            for item in resp.get("Events", []):
-                parsed = parse_event(item, event_name, region)
-                if parsed:
-                    rows.append(parsed)
-                    count += 1
-
-            token = resp.get("NextToken")
-            if not token:
-                break
-
-        if pages >= max_pages and token:
-            log(f"[WARNING] CloudTrail {region} {event_name}: page cap hit "
-                f"({max_pages}); results truncated")
-        log(f"   [{region}] {event_name}: {count} events ({pages} pages)",
-            verbose_only=True)
-
-    log(f"[CloudTrail] {region}: done, {len(rows)} events in {time.monotonic() - t0:.0f}s")
-    return rows
-
-
-def get_cloudtrail_activity(session, regions, days, budget, workers, max_pages):
-    log(f"\n[CloudTrail] Scanning {len(regions)} region(s): {', '.join(regions)}")
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=days)
-
-    # Clients are created on the main thread (Session is not thread-safe)
-    clients = {r: get_client(session, "cloudtrail", r) for r in regions}
-
-    all_events = []
-    executor = ThreadPoolExecutor(max_workers=max(1, workers))
-    futures = {
-        executor.submit(scan_cloudtrail_region, clients[r], r, start_time,
-                        end_time, budget, max_pages): r
-        for r in regions
-    }
-    try:
-        for fut in as_completed(futures):
-            try:
-                all_events.extend(fut.result())
-            except Exception as exc:  # keep going if one region fails
-                log(f"[WARNING] CloudTrail {futures[fut]} failed: {exc}")
-    except KeyboardInterrupt:
-        log("\n[Interrupted] Stopping CloudTrail scan; using events collected so far...")
-        STOP.set()
-        for fut in futures:
-            if fut.done() and not fut.cancelled():
-                try:
-                    all_events.extend(fut.result())
-                except Exception:
-                    pass
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-
-    log(f"[CloudTrail] Total events collected: {len(all_events)}")
-    return all_events
-
-
-# ============================================================
-# IAM RESOURCE ATTRIBUTION
-# ============================================================
-
-def extract_principal_from_row(event):
-    if not event:
-        return {}
-    return {
-        "Principal Name": event.get("Principal Name", "Unknown"),
-        "Principal Type": event.get("Principal Type", "Unknown"),
-        "Principal ARN": event.get("Principal ARN", ""),
-        "Session Issuer ARN": event.get("Session Issuer ARN", ""),
-        "Session Name": event.get("Session Name", ""),
-    }
-
-
-def attribute_resources(resources, cloudtrail_events):
-    log("\n[Attribution] Mapping IAM activity to resources...")
-
-    attribution_rows, timeline_rows, unidentified_rows = [], [], []
-
-    # index events by service for speed
-    events_by_service = {}
-    for ev in cloudtrail_events:
-        events_by_service.setdefault(ev.get("Detected Service"), []).append(ev)
-
-    for resource in resources:
-        service = resource.get("Service", "")
-        resource_id = str(resource.get("Resource ID") or "").strip()
-        resource_keys = get_resource_match_keys(resource)
-        resource_region = resource.get("Region", "")
-
-        matched_events = []
-        for event in events_by_service.get(service, []):
-            if event.get("AWS Service") not in SERVICE_EVENT_SOURCES.get(service, set()):
+def sc_ec2(s):
+    ec2 = s.client("ec2")
+    for p in pages(ec2, "describe_instances"):
+        for r in p.get("Reservations", []):
+            for i in r.get("Instances", []):
+                st = i["State"]["Name"]
+                if st == "terminated":
+                    continue
+                t = tags_of(i.get("Tags"))
+                s.add(s.arn("ec2", f"instance/{i['InstanceId']}"), t.get("Name"), st, t,
+                      i.get("LaunchTime"))
+    for p in pages(ec2, "describe_volumes"):
+        for v in p.get("Volumes", []):
+            t = tags_of(v.get("Tags"))
+            st = "available (unattached)" if v["State"] == "available" else v["State"]
+            s.add(s.arn("ec2", f"volume/{v['VolumeId']}"), t.get("Name"), st, t,
+                  v.get("CreateTime"))
+    for p in pages(ec2, "describe_snapshots", OwnerIds=["self"]):
+        for sn in p.get("Snapshots", []):
+            t = tags_of(sn.get("Tags"))
+            s.add(s.arn("ec2", f"snapshot/{sn['SnapshotId']}", with_account=False),
+                  t.get("Name"), sn.get("State"), t, sn.get("StartTime"))
+    for p in pages(ec2, "describe_nat_gateways"):
+        for n in p.get("NatGateways", []):
+            if n.get("State") == "deleted":
                 continue
-            event_region = event.get("AWS Region", "")
-            if resource_region and event_region and resource_region != event_region:
+            t = tags_of(n.get("Tags"))
+            s.add(s.arn("ec2", f"natgateway/{n['NatGatewayId']}"), t.get("Name"),
+                  n.get("State"), t, n.get("CreateTime"))
+    for a in ec2.describe_addresses().get("Addresses", []):
+        if not a.get("AllocationId"):
+            continue
+        t = tags_of(a.get("Tags"))
+        st = "associated" if a.get("AssociationId") else "unassociated"
+        s.add(s.arn("ec2", f"elastic-ip/{a['AllocationId']}"), t.get("Name"), st, t)
+    for p in pages(ec2, "describe_vpc_endpoints"):
+        for e in p.get("VpcEndpoints", []):
+            if str(e.get("State", "")).lower() == "deleted":
                 continue
-            if resource_keys.intersection(event.get("_resource_keys", set())):
-                matched_events.append(event)
-
-        matched_events.sort(key=lambda item: str(item.get("Event Time", "")))
-
-        creation_names = CREATION_EVENTS.get(service, set())
-        start_names = START_EVENTS.get(service, set())
-
-        creation_events = [e for e in matched_events if e.get("Event Name") in creation_names]
-        start_events = [e for e in matched_events if e.get("Event Name") in start_names]
-
-        creator_event = creation_events[0] if creation_events else None
-        starter_event = start_events[-1] if start_events else None
-        latest_event = matched_events[-1] if matched_events else None
-
-        creator = extract_principal_from_row(creator_event)
-        starter = extract_principal_from_row(starter_event)
-        latest = extract_principal_from_row(latest_event)
-
-        created_at = (creator_event.get("Event Time") if creator_event
-                      else resource.get("Created At", ""))
-
-        if creator_event:
-            status = "Creator Identified"
-        elif matched_events:
-            status = "Activity Found - Creator Not Confirmed"
-        else:
-            status = "No Matching CloudTrail Event"
-
-        attribution_rows.append({
-            "Service": service,
-            "Resource Type": resource.get("Resource Type", ""),
-            "Resource ID": resource_id,
-            "Resource Name": resource.get("Name", ""),
-            "Region": resource_region,
-            "Current State": resource.get("State", ""),
-            "Created By": creator.get("Principal Name", "Unknown"),
-            "Principal Type": creator.get("Principal Type", "Unknown"),
-            "Creator ARN": creator.get("Principal ARN", ""),
-            "Creator Role ARN": creator.get("Session Issuer ARN", ""),
-            "Creator Session Name": creator.get("Session Name", ""),
-            "Created At": created_at,
-            "Creation Event": creator_event.get("Event Name", "") if creator_event else "",
-            "Started By": starter.get("Principal Name", "Unknown") if starter_event else "N/A",
-            "Starter Principal Type": starter.get("Principal Type", "") if starter_event else "",
-            "Starter ARN": starter.get("Principal ARN", "") if starter_event else "",
-            "Started At": starter_event.get("Event Time", "") if starter_event else "",
-            "Latest Activity By": latest.get("Principal Name", "Unknown"),
-            "Latest Activity": latest_event.get("Event Name", "") if latest_event else "",
-            "Latest Activity Time": latest_event.get("Event Time", "") if latest_event else "",
-            "Matched CloudTrail Events": len(matched_events),
-            "Attribution Status": status,
-            "Cost Attribution": "Not directly available from Cost Explorer",
-        })
-
-        if not creator_event:
-            if matched_events:
-                reason = ("Related activity was found, but no matching creation event "
-                          "was found in the selected CloudTrail period.")
-            else:
-                reason = ("No exact service-specific resource identifier match was found. "
-                          "The resource may predate the lookback period, belong to another "
-                          "account, or use an event not included in the targeted event list.")
-            unidentified_rows.append({
-                "Service": service,
-                "Resource Type": resource.get("Resource Type", ""),
-                "Resource ID": resource_id,
-                "Resource Name": resource.get("Name", ""),
-                "Region": resource_region,
-                "Matched Events": len(matched_events),
-                "Reason": reason,
-            })
-
-    for event in cloudtrail_events:
-        timeline_rows.append({k: v for k, v in event.items() if not k.startswith("_")})
-
-    identified = sum(1 for r in attribution_rows if r["Attribution Status"] == "Creator Identified")
-    log(f"[Attribution] Confirmed creators: {identified}/{len(resources)}")
-    log(f"[Attribution] Unidentified resources: {len(unidentified_rows)}")
-    return attribution_rows, timeline_rows, unidentified_rows
+            t = tags_of(e.get("Tags"))
+            s.add(s.arn("ec2", f"vpc-endpoint/{e['VpcEndpointId']}"), t.get("Name"),
+                  e.get("State"), t, e.get("CreationTimestamp"))
 
 
-# ============================================================
-# KIRO DIAGNOSTIC
-# ============================================================
+def sc_rds(s):
+    rds = s.client("rds")
+    for p in pages(rds, "describe_db_instances"):
+        for d in p.get("DBInstances", []):
+            s.add(d["DBInstanceArn"], d["DBInstanceIdentifier"], d.get("DBInstanceStatus"),
+                  tags_of(d.get("TagList")), d.get("InstanceCreateTime"))
+    for p in pages(rds, "describe_db_clusters"):
+        for d in p.get("DBClusters", []):
+            s.add(d["DBClusterArn"], d["DBClusterIdentifier"], d.get("Status"),
+                  tags_of(d.get("TagList")), d.get("ClusterCreateTime"))
 
-def kiro_diagnostic(session, identity, region):
-    log("\n[Kiro] Checking identity information...")
-    rows = [
-        {"Check": "Current AWS Identity", "Result": identity.get("Arn", ""),
-         "Status": "Retrieved",
-         "Explanation": "Identifies the AWS credentials used by this script. "
-                        "It does not prove Kiro subscription assignment."},
-        {"Check": "AWS Account", "Result": identity.get("Account", ""),
-         "Status": "Retrieved",
-         "Explanation": "AWS account associated with current credentials."},
-    ]
+
+def sc_lambda(s):
+    lam = s.client("lambda")
+    for p in pages(lam, "list_functions"):
+        for f in p.get("Functions", []):
+            s.add(f["FunctionArn"], f["FunctionName"], f.get("State") or "Active", {},
+                  f.get("LastModified"))
+
+
+def sc_eks(s):
+    eks = s.client("eks")
+    for p in pages(eks, "list_clusters"):
+        for name in p.get("clusters", []):
+            c = eks.describe_cluster(name=name)["cluster"]
+            s.add(c["arn"], name, c.get("status"), tags_of(c.get("tags")), c.get("createdAt"))
+
+
+def sc_ecs(s):
+    ecs = s.client("ecs")
+    arns = []
+    for p in pages(ecs, "list_clusters"):
+        arns.extend(p.get("clusterArns", []))
+    for i in range(0, len(arns), 100):
+        resp = ecs.describe_clusters(clusters=arns[i:i + 100], include=["TAGS"])
+        for c in resp.get("clusters", []):
+            s.add(c["clusterArn"], c.get("clusterName"), c.get("status"),
+                  tags_of(c.get("tags")))
+
+
+def sc_elbv2(s):
+    elb = s.client("elbv2")
+    for p in pages(elb, "describe_load_balancers"):
+        for lb in p.get("LoadBalancers", []):
+            s.add(lb["LoadBalancerArn"], lb.get("LoadBalancerName"),
+                  lb.get("State", {}).get("Code"), {}, lb.get("CreatedTime"))
+
+
+def sc_dynamodb(s):
+    ddb = s.client("dynamodb")
+    for p in pages(ddb, "list_tables"):
+        for name in p.get("TableNames", []):
+            t = ddb.describe_table(TableName=name)["Table"]
+            s.add(t["TableArn"], name, t.get("TableStatus"), {}, t.get("CreationDateTime"))
+
+
+def sc_elasticache(s):
+    ec = s.client("elasticache")
+    for p in pages(ec, "describe_cache_clusters"):
+        for c in p.get("CacheClusters", []):
+            if c.get("ARN"):
+                s.add(c["ARN"], c["CacheClusterId"], c.get("CacheClusterStatus"), {},
+                      c.get("CacheClusterCreateTime"))
+
+
+def sc_opensearch(s):
+    os_ = s.client("opensearch")
+    names = [d["DomainName"] for d in os_.list_domain_names().get("DomainNames", [])]
+    for i in range(0, len(names), 5):
+        for d in os_.describe_domains(DomainNames=names[i:i + 5]).get("DomainStatusList", []):
+            if d.get("Deleted"):
+                continue
+            st = "processing" if d.get("Processing") else "active"
+            s.add(d["ARN"], d["DomainName"], st, {})
+
+
+def sc_sagemaker(s):
+    sm = s.client("sagemaker")
+    for p in pages(sm, "list_endpoints"):
+        for e in p.get("Endpoints", []):
+            s.add(e["EndpointArn"], e["EndpointName"], e.get("EndpointStatus"), {},
+                  e.get("CreationTime"))
+    for p in pages(sm, "list_notebook_instances"):
+        for n in p.get("NotebookInstances", []):
+            s.add(n["NotebookInstanceArn"], n["NotebookInstanceName"],
+                  n.get("NotebookInstanceStatus"), {}, n.get("CreationTime"))
+
+
+def sc_bedrock(s):
+    br = s.client("bedrock")
     try:
-        sso = get_client(session, "sso-admin", region)
-        instances = sso.list_instances().get("Instances", [])
-        if instances:
-            for inst in instances:
-                rows.append({
-                    "Check": "Identity Center Instance",
-                    "Result": inst.get("InstanceArn", ""),
-                    "Status": "Visible",
-                    "Explanation": "Identity Center instance is visible. "
-                                   "This does not confirm Kiro seat assignment."})
-        else:
-            rows.append({
-                "Check": "Identity Center Instance",
-                "Result": "No instance returned", "Status": "Not Found",
-                "Explanation": "No Identity Center instance was returned in this "
-                               "account and region context."})
-    except (ClientError, BotoCoreError) as exc:
-        rows.append({
-            "Check": "Identity Center Visibility", "Result": str(exc),
-            "Status": "Unavailable",
-            "Explanation": "The script could not verify Identity Center visibility."})
+        for p in pages(br, "list_provisioned_model_throughputs"):
+            for m in p.get("provisionedModelSummaries", []):
+                s.add(m["provisionedModelArn"], m.get("provisionedModelName"),
+                      m.get("status"), {}, m.get("creationTime"))
+    except Exception as exc:
+        log(f"[WARN] {s.region} Bedrock provisioned throughput: {short(exc)}", True)
+    for op, key, label in (("list_custom_models", "modelSummaries", "custom model"),
+                           ("list_imported_models", "modelSummaries", "imported model")):
+        try:
+            for p in pages(br, op):
+                for m in p.get(key, []):
+                    s.add(m["modelArn"], m.get("modelName"), "active", {},
+                          m.get("creationTime"))
+        except Exception as exc:
+            log(f"[WARN] {s.region} Bedrock {label}: {short(exc)}", True)
+    try:
+        for p in pages(br, "list_guardrails"):
+            for g in p.get("guardrails", []):
+                s.add(g["arn"], g.get("name"), g.get("status"), {}, g.get("createdAt"))
+    except Exception as exc:
+        log(f"[WARN] {s.region} Bedrock guardrails: {short(exc)}", True)
 
-    rows.append({
-        "Check": "Kiro Subscription Assignment",
-        "Result": "Manual admin-console verification required",
-        "Status": "Not Verified",
-        "Explanation": "This script cannot conclusively verify Kiro seat assignment. "
-                       "Check Kiro Users & Groups > Subscriptions, user identity, "
-                       "subscription status and organization settings."})
-    return rows
-
-
-def get_missing_owner_tags(resources):
-    rows = []
-    for r in resources:
-        if not r.get("Owner Tag"):
-            rows.append({
-                "Service": r.get("Service"),
-                "Resource Type": r.get("Resource Type"),
-                "Resource ID": r.get("Resource ID"),
-                "Name": r.get("Name"),
-                "Region": r.get("Region"),
-                "Issue": "Owner tag missing",
-                "Explanation": "Resource creator cannot be reliably identified "
-                               "from current resource tags.",
-            })
-    return rows
+    ba = s.client("bedrock-agent")
+    try:
+        for p in pages(ba, "list_agents"):
+            for a in p.get("agentSummaries", []):
+                s.add(s.arn("bedrock", f"agent/{a['agentId']}"), a.get("agentName"),
+                      a.get("agentStatus"), {}, a.get("updatedAt"))
+    except Exception as exc:
+        log(f"[WARN] {s.region} Bedrock agents: {short(exc)}", True)
+    try:
+        for p in pages(ba, "list_knowledge_bases"):
+            for k in p.get("knowledgeBaseSummaries", []):
+                s.add(s.arn("bedrock", f"knowledge-base/{k['knowledgeBaseId']}"),
+                      k.get("name"), k.get("status"), {}, k.get("updatedAt"))
+    except Exception as exc:
+        log(f"[WARN] {s.region} Bedrock knowledge bases: {short(exc)}", True)
 
 
-# ============================================================
-# FINAL SUMMARY (cost + region + status + IAM owner)
-# ============================================================
+def sc_logs(s):
+    logs = s.client("logs")
+    for p in pages(logs, "describe_log_groups"):
+        for g in p.get("logGroups", []):
+            arn = g["arn"][:-2] if g["arn"].endswith(":*") else g["arn"]
+            created = datetime.fromtimestamp(g["creationTime"] / 1000, tz=timezone.utc) \
+                if g.get("creationTime") else None
+            s.add(arn, g["logGroupName"], "active", {}, created)
 
-ACTIVE_STATES = {
-    "running", "available", "in-use", "in_use", "active", "creating", "pending",
-    "starting", "modifying", "backing-up", "provisioning", "configuring-enhanced-monitoring",
-    "storage-optimization", "upgrading", "rebooting",
-}
-INACTIVE_STATES = {
-    "stopped", "stopping", "terminated", "shutting-down", "deleted", "deleting",
-    "failed", "inactive", "error", "deleted-by-aws",
-}
 
-# Cost Explorer service name (substring, lowercase) -> inventory service(s)
-COST_TO_INVENTORY = [
-    ("ec2 - other", ["EC2", "EBS"]),
-    ("elastic compute cloud", ["EC2"]),
-    ("simple storage service", ["S3"]),
-    ("relational database", ["RDS"]),
-    ("lambda", ["Lambda"]),
-    ("kubernetes", ["EKS"]),
-    ("elastic load balancing", ["ELB"]),
+def sc_secrets(s):
+    sm = s.client("secretsmanager")
+    for p in pages(sm, "list_secrets"):
+        for x in p.get("SecretList", []):
+            if x.get("DeletedDate"):
+                continue
+            s.add(x["ARN"], x["Name"], "active", tags_of(x.get("Tags")), x.get("CreatedDate"))
+
+
+def sc_redshift(s):
+    rs = s.client("redshift")
+    for p in pages(rs, "describe_clusters"):
+        for c in p.get("Clusters", []):
+            s.add(s.arn("redshift", f"cluster:{c['ClusterIdentifier']}"),
+                  c["ClusterIdentifier"], c.get("ClusterStatus"), tags_of(c.get("Tags")),
+                  c.get("ClusterCreateTime"))
+
+
+def sc_ecr(s):
+    ecr = s.client("ecr")
+    for p in pages(ecr, "describe_repositories"):
+        for r in p.get("repositories", []):
+            s.add(r["repositoryArn"], r["repositoryName"], "active", {}, r.get("createdAt"))
+
+
+SCANNERS = [
+    ("EC2/EBS/NAT/EIP", sc_ec2), ("RDS", sc_rds), ("Lambda", sc_lambda), ("EKS", sc_eks),
+    ("ECS", sc_ecs), ("ELBv2", sc_elbv2), ("DynamoDB", sc_dynamodb),
+    ("ElastiCache", sc_elasticache), ("OpenSearch", sc_opensearch),
+    ("SageMaker", sc_sagemaker), ("Bedrock", sc_bedrock), ("CloudWatch Logs", sc_logs),
+    ("Secrets Manager", sc_secrets), ("Redshift", sc_redshift), ("ECR", sc_ecr),
 ]
 
 
-def inventory_services_for(cost_service):
-    name = (cost_service or "").lower()
-    for needle, services in COST_TO_INVENTORY:
-        if needle in name:
-            return services
-    return []
+def merge_tagging_api(s):
+    """Fill tags on scanned resources and add any other tagged resource."""
+    tg = s.client("resourcegroupstaggingapi")
+    added = 0
+    for p in pages(tg, "get_resources", ResourcesPerPage=100):
+        for m in p.get("ResourceTagMappingList", []):
+            arn = m["ResourceARN"]
+            tags = tags_of(m.get("Tags"))
+            if arn in s.items:
+                if tags and not s.items[arn]["Tags"]:
+                    s.items[arn]["Tags"] = tags
+                continue
+            svc, _, kind, rid = parse_arn(arn)
+            if svc == "ec2" and kind not in BILLABLE_EC2:
+                continue
+            s.add(arn, tags.get("Name") or rid, "unknown", tags)
+            added += 1
+    return added
 
 
-def principal_label(name, ptype, session=""):
-    if not name or name in {"Unknown", "N/A"}:
-        return ""
-    label = f"{name} ({ptype})" if ptype else name
-    if session and ptype == "Assumed IAM Role":
-        label = f"{name}/{session} ({ptype})"
-    return label
+def scan_region(profile, region, acct, partition):
+    session = boto3.Session(profile_name=profile, region_name=region)
+    s = Scan(session, region, acct, partition)
+    log(f"[Inventory] {region}: scanning...")
+    for name, fn in SCANNERS:
+        if STOP.is_set():
+            break
+        t0, before = time.monotonic(), len(s.items)
+        try:
+            fn(s)
+            log(f"   [{region}] {name}: {len(s.items) - before} found "
+                f"({time.monotonic() - t0:.1f}s)", verbose_only=True)
+        except Exception as exc:
+            log(f"[WARN] {region} {name}: {short(exc)}")
+    try:
+        added = merge_tagging_api(s)
+        log(f"   [{region}] tagging API: +{added} extra tagged resources", verbose_only=True)
+    except Exception as exc:
+        log(f"[WARN] {region} tagging API failed (tags may be incomplete): {short(exc)}")
+    log(f"[Inventory] {region}: {len(s.items)} resources")
+    return list(s.items.values())
 
 
-def build_final_summary(region_cost, resources, iam_attribution, cloudtrail_ran):
-    """One row per (Service, Region): cost, status, resource states, IAM owner."""
-    log("\n[Summary] Building final summary sheet...")
+def scan_s3(session, home_region, acct, target_regions):
+    """S3 is global in the API: list once, place each bucket in its own region."""
+    out = []
+    try:
+        s3 = get_client(session, "s3", "us-east-1")
+        buckets = s3.list_buckets().get("Buckets", [])
+        log(f"[Inventory] S3: {len(buckets)} buckets, resolving regions...")
+        for b in buckets:
+            if STOP.is_set():
+                break
+            region = "us-east-1"
+            try:
+                loc = s3.get_bucket_location(Bucket=b["Name"]).get("LocationConstraint")
+                if loc:
+                    region = "eu-west-1" if loc == "EU" else loc
+            except (ClientError, BotoCoreError):
+                continue
+            if region not in target_regions:
+                continue
+            out.append({
+                "Key": f"arn:aws:s3:::{b['Name']}", "ARN": f"arn:aws:s3:::{b['Name']}",
+                "Region": region, "Svc": "s3", "Kind": "bucket", "ID": b["Name"],
+                "Name": b["Name"], "State": "active", "Tags": {},
+                "Created": b.get("CreationDate"), "CostService": None,
+                "Attribution": "Not checked", "CreatedBy": "", "PrincipalType": "",
+                "ViaRole": "", "CreatorARN": "", "CreatedAt": "",
+            })
+    except Exception as exc:
+        log(f"[WARN] S3 scan: {short(exc)}")
+    return out
 
-    attr_by_resource = {}
-    for a in iam_attribution:
-        attr_by_resource[(a.get("Service"), a.get("Resource ID"), a.get("Region"))] = a
 
-    months = sorted({r.get("Period Start", "")[:7] for r in region_cost if r.get("Period Start")})
+def merge_items(batches):
+    merged = {}
+    for batch in batches:
+        for it in batch:
+            cur = merged.get(it["Key"])
+            if not cur:
+                merged[it["Key"]] = it
+                continue
+            if it["Tags"] and not cur["Tags"]:
+                cur["Tags"] = it["Tags"]
+            if cur["State"] == "unknown" and it["State"] != "unknown":
+                cur["State"] = it["State"]
+            if not cur["Created"] and it["Created"]:
+                cur["Created"] = it["Created"]
+    return list(merged.values())
 
-    # cost grouped by (service, region)
-    groups = {}
-    for r in region_cost:
-        key = (r.get("SERVICE", ""), r.get("REGION", ""))
-        g = groups.setdefault(key, {"total": 0.0, "months": {}})
-        g["total"] += r.get("Cost", 0) or 0
-        m = (r.get("Period Start", "") or "")[:7]
-        g["months"][m] = g["months"].get(m, 0) + (r.get("Cost", 0) or 0)
 
-    covered = set()  # (inventory service, region) already attached to a cost row
-    rows = []
+def assign_cost_services(items, costs):
+    by_region = defaultdict(list)
+    for (region, svc), c in costs.items():
+        by_region[region].append((svc, c))
+    for it in items:
+        for key in cost_keys_for(it["Svc"], it["Kind"]):
+            cands = [(c, svc) for svc, c in by_region.get(it["Region"], [])
+                     if key in svc.lower()]
+            if cands:
+                it["CostService"] = max(cands)[1]
+                break
 
-    def summarize(service_label, region, cost_info, matched):
-        states = {}
-        for res in matched:
-            st = (res.get("State") or "unknown").lower()
-            states[st] = states.get(st, 0) + 1
-        active = sum(c for s, c in states.items() if s in ACTIVE_STATES)
-        inactive = sum(c for s, c in states.items() if s in INACTIVE_STATES)
 
-        if not matched:
-            status = "No Resources Found"
-            note = ("No tracked resource in this service/region. Charge is usage-based, "
-                    "already deleted, or the service is not covered by the inventory.")
-        elif active and not inactive:
-            status, note = "Active", "All tracked resources are in an active state."
-        elif active and inactive:
-            status, note = "Partially Active", "Some resources are active, some stopped/inactive."
-        elif inactive and not active:
-            status, note = "Inactive", "All tracked resources are stopped/inactive (storage may still be billed)."
+# ============================================================
+# CLOUDTRAIL: WHO CREATED IT
+# ============================================================
+
+CREATE_RE = re.compile(r"^(Create|RunInstances|Allocate|Import|Launch|Provision|Register|"
+                       r"Copy|Restore)")
+
+
+def who(identity):
+    t = identity.get("type", "Unknown")
+    arn = identity.get("arn", "")
+    if t == "IAMUser":
+        return identity.get("userName") or arn.split("/")[-1], "IAM User", ""
+    if t == "AssumedRole":
+        issuer = identity.get("sessionContext", {}).get("sessionIssuer", {})
+        parts = arn.split("/")
+        role = issuer.get("userName") or (parts[-2] if len(parts) >= 2 else "")
+        return parts[-1], "Assumed Role", role
+    if t == "Root":
+        return "root", "Root", ""
+    if t == "AWSService":
+        return identity.get("invokedBy") or "AWS Service", "AWS Service", ""
+    return identity.get("userName") or arn or t, t, ""
+
+
+class Pacer:
+    """LookupEvents allows ~2 requests/second per region."""
+    def __init__(self, gap=0.55):
+        self.gap, self.last = gap, 0.0
+
+    def __call__(self):
+        wait = self.gap - (time.monotonic() - self.last)
+        if wait > 0:
+            time.sleep(wait)
+        self.last = time.monotonic()
+
+
+def lookup_creator(ct, it, start, end, pacer, max_pages):
+    keys = []
+    for k in (it["ID"], it["ARN"]):
+        if k and k not in keys:
+            keys.append(k)
+    events = []
+    for key in keys[:2]:
+        token, n = None, 0
+        while n < max_pages:
+            pacer()
+            kw = {"LookupAttributes": [{"AttributeKey": "ResourceName",
+                                        "AttributeValue": key}],
+                  "StartTime": start, "EndTime": end, "MaxResults": 50}
+            if token:
+                kw["NextToken"] = token
+            resp = ct.lookup_events(**kw)
+            n += 1
+            for e in resp.get("Events", []):
+                try:
+                    events.append((e["EventTime"], json.loads(e["CloudTrailEvent"])))
+                except (KeyError, ValueError, TypeError):
+                    continue
+            token = resp.get("NextToken")
+            if not token:
+                break
+        if events:
+            break
+    if not events:
+        return None
+    events.sort(key=lambda x: x[0])
+    ok = [x for x in events if not x[1].get("errorCode")]
+    created = [x for x in ok if CREATE_RE.match(x[1].get("eventName", ""))]
+    if created:
+        return "Creator confirmed", created[0][1]
+    writes = [x for x in ok if x[1].get("readOnly") is False]
+    if writes:
+        return "Earliest write activity (create event not in window)", writes[0][1]
+    return None
+
+
+def creators_for_region(profile, region, its, start, end, budget, max_pages):
+    session = boto3.Session(profile_name=profile, region_name=region)
+    ct = get_client(session, "cloudtrail", region)
+    pacer, t0, done = Pacer(), time.monotonic(), 0
+    its = sorted(its, key=lambda i: bool(i["Tags"]))   # untagged first
+    log(f"[CloudTrail] {region}: looking up {len(its)} resources (budget {budget}s)")
+    for it in its:
+        if STOP.is_set():
+            break
+        if time.monotonic() - t0 > budget:
+            log(f"[CloudTrail] {region}: time budget reached; remaining resources unchecked")
+            break
+        try:
+            res = lookup_creator(ct, it, start, end, pacer, max_pages)
+        except Exception as exc:
+            it["Attribution"] = f"Lookup error: {short(exc, 80)}"
+            continue
+        done += 1
+        if not res:
+            it["Attribution"] = "Not found (older than 90 days or not logged)"
+            it["CreatedBy"] = "Unknown"
+            continue
+        label, d = res
+        name, ptype, role = who(d.get("userIdentity", {}))
+        it.update({"Attribution": label, "CreatedBy": name, "PrincipalType": ptype,
+                   "ViaRole": role, "CreatorARN": d.get("userIdentity", {}).get("arn", ""),
+                   "CreatedAt": d.get("eventTime", "")})
+        log(f"   [{region}] {it['Svc']}:{it['Kind']} {it['ID']} -> {name}", verbose_only=True)
+    log(f"[CloudTrail] {region}: {done} lookups in {time.monotonic() - t0:.0f}s")
+
+
+def run_creator_lookups(profile, items, days, budget, workers, max_pages):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    by_region = defaultdict(list)
+    for it in items:
+        if it["CostService"]:
+            by_region[it["Region"]].append(it)
+    if not by_region:
+        return
+    log(f"\n[CloudTrail] Creator lookup in {len(by_region)} region(s)...")
+    ex = ThreadPoolExecutor(max_workers=max(1, workers))
+    futs = {ex.submit(creators_for_region, profile, r, its, start, end, budget, max_pages): r
+            for r, its in by_region.items()}
+    try:
+        for f in as_completed(futs):
+            try:
+                f.result()
+            except Exception as exc:
+                log(f"[WARN] CloudTrail {futs[f]}: {short(exc)}")
+    except KeyboardInterrupt:
+        STOP.set()
+        log("\n[Interrupted] stopping CloudTrail lookups, keeping what was found...")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
+# ============================================================
+# REPORT BUILDING
+# ============================================================
+
+def tag_string(tags):
+    return "; ".join(f"{k}={v}" for k, v in sorted(tags.items()))
+
+
+def build_report(costs, usage, items, ascending, required_tags):
+    by_svc = defaultdict(list)
+    for it in items:
+        if it["CostService"]:
+            by_svc[(it["Region"], it["CostService"])].append(it)
+
+    region_total = defaultdict(float)
+    for (region, _), c in costs.items():
+        region_total[region] += c
+
+    def order(key):
+        region, _ = key
+        c = costs[key]
+        return (-region_total[region], region, c if ascending else -c)
+
+    summary, details, untagged, usage_rows = [], [], [], []
+    for key in sorted(costs, key=order):
+        region, svc = key
+        cost = costs[key]
+        its = by_svc.get(key, [])
+
+        counts = defaultdict(int)
+        for it in its:
+            counts[normalize_status(it["State"])] += 1
+        creators = []
+        for it in its:
+            c = it["CreatedBy"]
+            if c and c != "Unknown":
+                lab = f"{c} (via {it['ViaRole']})" if it["ViaRole"] else c
+                if lab not in creators:
+                    creators.append(lab)
+        n_untagged = sum(1 for it in its if not it["Tags"])
+
+        if not its:
+            if "bedrock" in svc.lower():
+                note = ("Usage-based (model invocations/tokens) - no resource exists to tag. "
+                        "See 'Usage Breakdown' for which model/usage type costs money.")
+            else:
+                note = ("No resource found: usage-based charge, resource already deleted, "
+                        "or service not covered by this script (check 'Usage Breakdown').")
         else:
-            status, note = "Unknown", "Resource states could not be classified."
+            note = ""
 
-        creators, starters, latest, arns = [], [], [], []
-        for res in matched:
-            a = attr_by_resource.get((res.get("Service"), res.get("Resource ID"), res.get("Region")), {})
-            c = principal_label(a.get("Created By"), a.get("Principal Type"), a.get("Creator Session Name", ""))
-            s = principal_label(a.get("Started By"), a.get("Starter Principal Type"))
-            l = principal_label(a.get("Latest Activity By"), "")
-            for lst, val in ((creators, c), (starters, s), (latest, l)):
-                if val and val not in lst:
-                    lst.append(val)
-            arn = a.get("Creator Role ARN") or a.get("Creator ARN")
-            if arn and arn not in arns:
-                arns.append(arn)
-            tag = res.get("Owner Tag")
-            if tag and f"tag:{tag}" not in creators and not c:
-                creators.append(f"tag:{tag}")
-
-        if matched and not creators:
-            creators_text = ("Not identified (CloudTrail skipped)" if not cloudtrail_ran
-                             else "Not identified (created before lookback window)")
-        elif not matched:
-            creators_text = "N/A (no tracked resources)"
-        else:
-            creators_text = "; ".join(creators)
-
-        row = {
-            "Service": service_label,
-            "Region": region,
-            "Service Status": status,
-            "Status Note": note,
-            "Total Cost (USD)": round(cost_info["total"], 6),
-        }
-        for m in months:
-            row[f"{m} Cost (USD)"] = round(cost_info["months"].get(m, 0), 6)
-        row.update({
-            "Resources Found": len(matched),
-            "Active Resources": active,
-            "Inactive Resources": inactive,
-            "Resource States": ", ".join(f"{s}: {c}" for s, c in sorted(states.items())) or "-",
-            "Resource IDs": "; ".join(str(r.get("Name") or r.get("Resource ID")) for r in matched[:15])
-                            + (" ..." if len(matched) > 15 else ""),
-            "Created By (IAM User / Role)": creators_text,
-            "Started By (IAM User / Role)": "; ".join(starters) if starters else "N/A",
-            "Latest Activity By": "; ".join(latest) if latest else "N/A",
-            "IAM Role / Principal ARN": "; ".join(arns) if arns else "",
+        top_usage = "; ".join(f"{u} (${c:,.2f})" for u, c in usage.get(key, [])[:3])
+        summary.append({
+            "Region": region, "Service": svc, "Cost (USD)": cost,
+            "Resources Found": len(its), "Untagged Resources": n_untagged,
+            "Active": counts["Active"], "Pending / Initializing": counts["Pending / Initializing"],
+            "Inactive / Stopped": counts["Inactive / Stopped"],
+            "Idle / Unattached": counts["Idle / Unattached"],
+            "Deleting / Failed": counts["Deleting / Failed"], "Unknown": counts["Unknown"],
+            "Created By (IAM user / session)": "; ".join(creators),
+            "Top Usage Types": top_usage, "Note": note,
         })
-        return row
 
-    for (service, region), cost_info in groups.items():
-        inv_services = inventory_services_for(service)
-        matched = [r for r in resources
-                   if r.get("Service") in inv_services and r.get("Region") == region]
-        for s in inv_services:
-            covered.add((s, region))
-        rows.append(summarize(service, region, cost_info, matched))
+        for ut, c in usage.get(key, []):
+            usage_rows.append({"Region": region, "Service": svc, "Usage Type": ut,
+                               "Cost (USD)": c})
 
-    # resources that exist but have no cost row (free tier / $0 omitted)
-    leftovers = {}
-    for res in resources:
-        if (res.get("Service"), res.get("Region")) not in covered:
-            leftovers.setdefault((res.get("Service"), res.get("Region")), []).append(res)
-    for (service, region), matched in leftovers.items():
-        rows.append(summarize(f"{service} (inventory only)", region,
-                              {"total": 0.0, "months": {}}, matched))
+        for it in sorted(its, key=lambda i: (bool(i["Tags"]), i["Kind"], i["ID"])):
+            row = {
+                "Region": region, "Service": svc, "Service Cost (USD)": cost,
+                "Resource Type": f"{it['Svc']}:{it['Kind']}", "Resource ID": it["ID"],
+                "Resource Name": it["Name"], "Status": normalize_status(it["State"]),
+                "Raw State": it["State"],
+                "Created By (IAM user / session)": it["CreatedBy"],
+                "Principal Type": it["PrincipalType"], "Via Role": it["ViaRole"],
+                "Creator ARN": it["CreatorARN"],
+                "Created At": it["CreatedAt"] or fmt_dt(it["Created"]),
+                "Attribution": it["Attribution"],
+                "Tagged?": "Yes" if it["Tags"] else "No",
+                "Tag Count": len(it["Tags"]), "Tags": tag_string(it["Tags"]),
+                "Resource ARN": it["ARN"],
+            }
+            if required_tags:
+                row["Missing Required Tags"] = ", ".join(
+                    t for t in required_tags if t not in it["Tags"])
+            details.append(row)
+            if not it["Tags"] or (required_tags and row["Missing Required Tags"]):
+                untagged.append(row)
 
-    rows.sort(key=lambda r: r["Total Cost (USD)"], reverse=True)  # default: high -> low
-    log(f"[Summary] {len(rows)} rows (sorted high to low by cost; "
-        f"use the header filter in Excel to change)")
-    return rows
-
-
-# ============================================================
-# EXCEL REPORT
-# ============================================================
-
-def clean_datetime(value):
-    if isinstance(value, pd.Timestamp):
-        if value.tzinfo is not None:
-            return value.tz_localize(None)
-    elif isinstance(value, datetime):
-        if value.tzinfo is not None:
-            return value.replace(tzinfo=None)
-    return value
+    return summary, details, untagged, usage_rows
 
 
-def generate_report(output, sheets):
-    log("\n[Report] Generating Excel report...")
-
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for sheet_name, data in sheets:
-            df = pd.DataFrame(data)
+def write_excel(path, sheets):
+    log("\n[Report] Writing Excel...")
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for name, rows in sheets:
+            df = pd.DataFrame(rows)
             if df.empty:
-                df = pd.DataFrame({"Information": ["No data returned or access unavailable."]})
-            df = df.apply(lambda column: column.map(clean_datetime))
-            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-            log(f"   sheet: {sheet_name} ({len(data)} rows)")
+                df = pd.DataFrame({"Information": ["No data."]})
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+            log(f"   sheet: {name} ({len(rows)} rows)")
+        for ws in writer.sheets.values():
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for col in ws.iter_cols():
+                header = str(col[0].value or "")
+                if "(USD)" in header:
+                    for c in col[1:]:
+                        if isinstance(c.value, (int, float)):
+                            c.number_format = "$#,##0.0000"
+                width = max((len(str(c.value)) for c in col if c.value is not None), default=8)
+                ws.column_dimensions[col[0].column_letter].width = min(width + 3, 60)
+    log(f"[SUCCESS] Report written: {path}")
 
-        for worksheet in writer.sheets.values():
-            worksheet.freeze_panes = "A2"
-            worksheet.auto_filter.ref = worksheet.dimensions  # header dropdown = sort high/low
 
-            for column in worksheet.iter_cols():
-                header = str(column[0].value or "").strip().lower()
-                if "cost" in header or "amount" in header:
-                    for cell in column[1:]:
-                        if isinstance(cell.value, (int, float)):
-                            cell.number_format = (
-                                '$#,##0.0000;[Red]-$#,##0.0000'
-                                if worksheet.title == "Final Summary"
-                                else '$#,##0.00000000;[Red]-$#,##0.00000000')
-
-                max_length = 0
-                for cell in column:
-                    try:
-                        max_length = max(max_length, len(str(cell.value)))
-                    except Exception:
-                        pass
-                worksheet.column_dimensions[column[0].column_letter].width = min(max_length + 3, 55)
-
-    log(f"[SUCCESS] Report generated: {output}")
+def print_console_summary(summary):
+    log("\n" + "=" * 100)
+    log(f"{'REGION':<16}{'SERVICE':<46}{'COST USD':>11}{'RES':>5}{'UNTAGGED':>10}  CREATED BY")
+    log("=" * 100)
+    for r in summary:
+        log(f"{r['Region']:<16}{r['Service'][:44]:<46}{r['Cost (USD)']:>11,.2f}"
+            f"{r['Resources Found']:>5}{r['Untagged Resources']:>10}  "
+            f"{r['Created By (IAM user / session)'][:40]}")
 
 
 # ============================================================
@@ -1148,143 +872,122 @@ def generate_report(output, sheets):
 
 def main():
     global VERBOSE
-
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
 
-    parser = argparse.ArgumentParser(description="AWS Cost and IAM Resource Audit")
-    parser.add_argument("--profile", default=os.getenv("AWS_PROFILE", DEFAULT_PROFILE))
-    parser.add_argument("--region", default=DEFAULT_REGION)
-    parser.add_argument("--days", type=int, default=DEFAULT_DAYS)
-    parser.add_argument("--output", default="AWS_Cost_IAM_Audit.xlsx")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="print per-call progress")
-    parser.add_argument("--debug", action="store_true",
-                        help="log botocore HTTP requests/retries (very chatty)")
-    parser.add_argument("--skip-cost", action="store_true",
-                        help="skip Cost Explorer queries")
-    parser.add_argument("--skip-cloudtrail", action="store_true",
-                        help="skip CloudTrail scan (inventory + cost only)")
-    parser.add_argument("--all-regions", action="store_true",
-                        help="scan CloudTrail in ALL enabled regions (slow)")
-    parser.add_argument("--region-budget", type=int, default=90,
-                        help="max seconds of CloudTrail scanning per region (default 90)")
-    parser.add_argument("--max-pages", type=int, default=40,
-                        help="max CloudTrail pages (50 events each) per event type")
-    parser.add_argument("--workers", type=int, default=4,
-                        help="parallel CloudTrail regions (default 4)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="AWS cleanup audit (billed + untagged resources)")
+    ap.add_argument("--profile", default=os.getenv("AWS_PROFILE", DEFAULT_PROFILE))
+    ap.add_argument("--region", default=DEFAULT_REGION, help="home region for STS")
+    ap.add_argument("--regions", help="comma list; default = every region that has cost")
+    ap.add_argument("--days", type=int, default=DEFAULT_DAYS, help="billing window (1-90)")
+    ap.add_argument("--min-cost", type=float, default=0.0,
+                    help="keep only services with cost above this (default: anything > $0)")
+    ap.add_argument("--ascending", action="store_true",
+                    help="sort services low->high within each region (default high->low)")
+    ap.add_argument("--required-tags", default="",
+                    help="comma list, e.g. Owner,Environment; adds a 'Missing Required Tags' column")
+    ap.add_argument("--output", default="AWS_Cleanup_Audit.xlsx")
+    ap.add_argument("--skip-cloudtrail", action="store_true")
+    ap.add_argument("--region-budget", type=int, default=150,
+                    help="max seconds of CloudTrail lookups per region")
+    ap.add_argument("--max-pages", type=int, default=3)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+    VERBOSE = args.verbose
 
-    VERBOSE = args.verbose or args.debug
+    if not 1 <= args.days <= 90:
+        ap.error("--days must be between 1 and 90")
+    required_tags = [t.strip() for t in args.required_tags.split(",") if t.strip()]
 
-    if args.debug:
-        logging.basicConfig(level=logging.WARNING)
-        boto3.set_stream_logger("botocore.endpoint", logging.DEBUG)
-        boto3.set_stream_logger("botocore.retryhandler", logging.DEBUG)
-
-    if args.days < 1 or args.days > 90:
-        parser.error("--days must be between 1 and 90 for CloudTrail Event History.")
-
-    log("======================================")
-    log("        AWS COST + IAM AUDIT")
-    log("======================================")
+    log("=" * 40)
+    log("      AWS CLEANUP AUDIT")
+    log("=" * 40)
 
     try:
-        session, identity = create_session(args.profile, args.region)
+        session = boto3.Session(profile_name=args.profile, region_name=args.region)
+        ident = get_client(session, "sts", args.region).get_caller_identity()
     except (ClientError, BotoCoreError) as exc:
-        log(f"\nAWS authentication failed: {exc}")
-        log("If you use an MFA session profile, your temporary credentials may "
-            "have expired. Refresh them and retry.")
+        log(f"AWS authentication failed: {short(exc, 300)}")
+        log("If you use an MFA session profile, refresh the temporary credentials and retry.")
+        return
+    acct, partition = ident["Account"], ident["Arn"].split(":")[1]
+    log(f"Account {acct} | {ident['Arn']}")
+
+    end_d = datetime.now(timezone.utc).date() + timedelta(days=1)   # end is exclusive
+    start_d = end_d - timedelta(days=args.days + 1)
+    start, end = start_d.isoformat(), end_d.isoformat()
+    log(f"Billing window: {start} -> {end}")
+
+    # 1. Billing
+    try:
+        ce = get_client(session, "ce", "us-east-1")
+        costs, usage = get_costs(ce, start, end, args.min_cost)
+    except (ClientError, BotoCoreError) as exc:
+        log(f"Cost Explorer failed: {short(exc, 300)}")
+        return
+    if not costs:
+        log("No services with cost found for this window.")
         return
 
-    end_date = datetime.now(timezone.utc).date()
-    start_date = end_date - timedelta(days=args.days)
-    start, end = start_date.isoformat(), end_date.isoformat()
-    log(f"\nAudit period: {start} -> {end} ({args.days} days)")
-
-    service_cost = daily_cost = usage_cost = operation_cost = region_cost = []
-    forecast, explanations = [], []
-    resources, kiro, cloudtrail_events = [], [], []
-    iam_attribution, iam_timeline, unidentified = [], [], []
-
+    items = []
     try:
-        # 1. Inventory first, so resources show up immediately
-        resources = get_current_resources(session, args.region)
-
-        # 2. Cost Explorer
-        if not args.skip_cost:
-            log("\n[Cost] Querying Cost Explorer...")
-            ce = get_client(session, "ce", "us-east-1")
-            service_cost = get_service_cost(ce, start, end)
-            daily_cost = get_daily_cost(ce, start, end)
-            usage_cost = get_usage_breakdown(ce, start, end)
-            operation_cost = get_operation_breakdown(ce, start, end)
-            region_cost = get_region_cost(ce, start, end)
-            forecast = get_cost_forecast(ce)
-            explanations = explain_usage(usage_cost)
-
-        # 3. Kiro diagnostic
-        kiro = kiro_diagnostic(session, identity, args.region)
-
-        # 4. CloudTrail
-        if not args.skip_cloudtrail:
-            if args.all_regions:
-                regions = get_enabled_regions(session, args.region)
-            else:
-                regions = sorted({r["Region"] for r in resources if r.get("Region")}
-                                 | {args.region})
-            cloudtrail_events = get_cloudtrail_activity(
-                session, regions, args.days,
-                args.region_budget, args.workers, args.max_pages)
+        # 2. Resource scan, only where money was spent
+        if args.regions:
+            regions = [r.strip() for r in args.regions.split(",") if r.strip()]
         else:
-            log("\n[CloudTrail] Skipped (--skip-cloudtrail)")
+            regions = sorted({r for (r, _) in costs
+                              if re.match(r"^[a-z]{2}(-[a-z]+)+-\d$", r)})
+        log(f"\nRegions with cost: {', '.join(regions) or '(none - only global services)'}")
 
+        batches = []
+        ex = ThreadPoolExecutor(max_workers=max(1, args.workers))
+        futs = {ex.submit(scan_region, args.profile, r, acct, partition): r for r in regions}
+        try:
+            for f in as_completed(futs):
+                try:
+                    batches.append(f.result())
+                except Exception as exc:
+                    log(f"[WARN] scan {futs[f]} failed: {short(exc)}")
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        batches.append(scan_s3(session, args.region, acct, set(regions)))
+        items = merge_items(batches)
+        assign_cost_services(items, costs)
+        billed = [i for i in items if i["CostService"]]
+        log(f"\n[Inventory] {len(items)} resources total, {len(billed)} map to a billed service, "
+            f"{sum(1 for i in billed if not i['Tags'])} of those are untagged")
+
+        # 3. Who created them
+        if not args.skip_cloudtrail:
+            run_creator_lookups(args.profile, items, 90, args.region_budget,
+                                args.workers, args.max_pages)
+        else:
+            log("\n[CloudTrail] skipped")
     except KeyboardInterrupt:
         STOP.set()
-        log("\n[Interrupted] Ctrl+C received - writing report with data collected so far...")
+        log("\n[Interrupted] writing report with what was collected so far...")
 
-    # 5. Attribution + report (always runs, even after interrupt)
-    iam_attribution, iam_timeline, unidentified = attribute_resources(
-        resources, cloudtrail_events)
+    # 4. Report (always runs)
+    summary, details, untagged, usage_rows = build_report(
+        costs, usage, items, args.ascending, required_tags)
+    print_console_summary(summary)
+    write_excel(args.output, [
+        ("Region-Service Summary", summary),
+        ("Resource Details", details),
+        ("Untagged Resources", untagged),
+        ("Usage Breakdown", usage_rows),
+    ])
 
-    missing_tags = get_missing_owner_tags(resources)
-
-    final_summary = build_final_summary(
-        region_cost, resources, iam_attribution, not args.skip_cloudtrail)
-
-    sheets = [
-        ("Final Summary", final_summary),
-        ("Service Cost", service_cost),
-        ("Daily Cost Trend", daily_cost),
-        ("Usage Breakdown", usage_cost),
-        ("Operation Breakdown", operation_cost),
-        ("Region Breakdown", region_cost),
-        ("Cost Forecast", forecast),
-        ("Cost Explanation", explanations),
-        ("Current Resources", resources),
-        ("Missing Owner Tags", missing_tags),
-        ("Kiro Diagnostic", kiro),
-        ("IAM Resource Attribution", iam_attribution),
-        ("IAM Activity Timeline", iam_timeline),
-        ("Unidentified Resources", unidentified),
-    ]
-    generate_report(args.output, sheets)
-
-    log("\n======================================")
-    log("           AUDIT COMPLETED")
-    log("======================================")
-    log(f"Service Cost Rows:      {len(service_cost)}")
-    log(f"Daily Cost Rows:        {len(daily_cost)}")
-    log(f"Usage Breakdown Rows:   {len(usage_cost)}")
-    log(f"Current Resources:      {len(resources)}")
-    log(f"CloudTrail Events:      {len(cloudtrail_events)}")
-    log(f"IAM Attribution Rows:   {len(iam_attribution)}")
-    log(f"Unidentified Resources: {len(unidentified)}")
-    log(f"Confirmed Creators:     "
-        f"{sum(1 for r in iam_attribution if r.get('Attribution Status') == 'Creator Identified')}")
-    log(f"\nExcel File: {args.output}")
+    log(f"\nBilled services:      {len(summary)}")
+    log(f"Resources listed:     {len(details)}")
+    log(f"Untagged / to review: {len(untagged)}")
+    log(f"Excel file:           {args.output}")
+    log("\nNotes: cost is per service+region (Cost Explorer has no per-resource cost unless "
+        "resource-level data is enabled). CloudTrail only keeps 90 days of history, so older "
+        "resources show creator 'Unknown'.")
 
 
 if __name__ == "__main__":
