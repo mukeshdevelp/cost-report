@@ -222,13 +222,15 @@ COST_FILTER = {"Not": {"Dimensions": {"Key": "RECORD_TYPE",
                                       "Values": ["Credit", "Refund", "Tax"]}}}
 
 
-def ce_query(ce, start, end, dims):
+def ce_query(ce, start, end, dims, filter_expr=None):
+    if len(dims) > 2:
+        raise ValueError(f"Cost Explorer allows at most 2 GroupBy dimensions, got {len(dims)}")
     params = {
         "TimePeriod": {"Start": start, "End": end},
         "Granularity": "MONTHLY",
         "Metrics": ["UnblendedCost"],
         "GroupBy": [{"Type": "DIMENSION", "Key": d} for d in dims],
-        "Filter": COST_FILTER,
+        "Filter": filter_expr or COST_FILTER,
     }
     out = defaultdict(float)
     while True:
@@ -250,16 +252,222 @@ def get_costs(ce, start, end, min_cost):
     log(f"   {len(costs)} region/service pairs with cost > ${min_cost}")
 
     usage = defaultdict(list)
-    try:
-        raw_u = ce_query(ce, start, end, ["REGION", "SERVICE", "USAGE_TYPE"])
-        for (region, svc, ut), v in raw_u.items():
-            if round(v, 4) > 0 and (region, svc) in costs:
-                usage[(region, svc)].append((ut, round(v, 4)))
-        for k in usage:
-            usage[k].sort(key=lambda x: x[1], reverse=True)
-    except (ClientError, BotoCoreError) as exc:
-        log(f"[WARNING] Usage-type query failed: {short(exc)}")
+    log("[Billing] Usage types per region + service...")
+    for (region, svc) in sorted(costs.keys()):
+        filt = {
+            "And": [
+                COST_FILTER,
+                {"Dimensions": {"Key": "REGION", "Values": [region]}},
+                {"Dimensions": {"Key": "SERVICE", "Values": [svc]}},
+            ]
+        }
+        try:
+            raw_u = ce_query(ce, start, end, ["USAGE_TYPE"], filter_expr=filt)
+            for (ut,), v in raw_u.items():
+                if round(v, 4) > 0:
+                    usage[(region, svc)].append((ut, round(v, 4)))
+            usage[(region, svc)].sort(key=lambda x: x[1], reverse=True)
+        except (ClientError, BotoCoreError) as exc:
+            log(f"[WARNING] Usage types for {region}/{svc[:30]}: {short(exc)}")
+    log(f"   usage breakdown for {len(usage)} region/service pairs")
     return costs, usage
+
+
+def clip_resource_cost_period(start, end):
+    """Cost Explorer resource-level data is only available for the last 14 days."""
+    today = datetime.now(timezone.utc).date()
+    start_d = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    floor = today - timedelta(days=14)
+    clipped = start_d < floor
+    if clipped:
+        start_d = floor
+    return start_d.isoformat(), end_d.isoformat(), clipped
+
+
+def ce_resource_id_aliases(raw):
+    """Normalize Cost Explorer RESOURCE_ID keys for matching inventory IDs."""
+    raw = (raw or "").strip()
+    if not raw:
+        return set()
+    out = {raw}
+    if raw.startswith("arn:"):
+        out.add(raw.split(":", 5)[-1])
+    if "/" in raw:
+        out.add(raw.split("/")[-1])
+    if ":" in raw and not raw.startswith("arn:"):
+        out.add(raw.rsplit(":", 1)[-1])
+    return {x for x in out if x}
+
+
+def fetch_resource_costs(ce, start, end, service_keys):
+    """
+    Per-resource UnblendedCost from GetCostAndUsageWithResources.
+    Returns ((region, service, resource_id) -> usd, enabled_flag, period_clipped).
+    """
+    r_start, r_end, clipped = clip_resource_cost_period(start, end)
+    if clipped:
+        log("[Billing] Per-resource costs use the last 14 days only (AWS Cost Explorer limit).")
+
+    out = defaultdict(float)
+    any_ok = False
+    logged_ce_skip = False
+    log("\n[Billing] Fetching per-resource costs (Cost Explorer resource-level data)...")
+
+    for region, svc in sorted(service_keys):
+        filt = {
+            "And": [
+                COST_FILTER,
+                {"Dimensions": {"Key": "REGION", "Values": [region]}},
+                {"Dimensions": {"Key": "SERVICE", "Values": [svc]}},
+            ]
+        }
+        params = {
+            "TimePeriod": {"Start": r_start, "End": r_end},
+            "Granularity": "DAILY",
+            "Metrics": ["UnblendedCost"],
+            "GroupBy": [{"Type": "DIMENSION", "Key": "RESOURCE_ID"}],
+            "Filter": filt,
+        }
+        token, n = None, 0
+        while True:
+            if token:
+                params["NextPageToken"] = token
+            elif "NextPageToken" in params:
+                del params["NextPageToken"]
+            try:
+                resp = ce.get_cost_and_usage_with_resources(**params)
+            except (ClientError, BotoCoreError) as exc:
+                if not logged_ce_skip:
+                    log("[Billing] Per-resource CE data not available (enable resource-level "
+                        "data in Cost Explorer → Settings for exact per-ID costs). "
+                        f"Using usage-type allocation. ({short(exc, 200)})")
+                    logged_ce_skip = True
+                break
+            n += 1
+            any_ok = True
+            for period in resp.get("ResultsByTime", []):
+                for g in period.get("Groups", []):
+                    keys = g.get("Keys") or []
+                    if not keys:
+                        continue
+                    amt = float(g["Metrics"]["UnblendedCost"]["Amount"])
+                    if amt:
+                        out[(region, svc, keys[0])] += amt
+            token = resp.get("NextPageToken")
+            if not token:
+                break
+        if n:
+            log(f"   {region} · {svc[:40]}: {sum(1 for k in out if k[0] == region and k[1] == svc)} "
+                f"resource cost line(s)", verbose_only=True)
+
+    out = {k: round(v, 4) for k, v in out.items() if round(v, 4) > 0}
+    enabled = bool(out)
+    log(f"   {len(out)} resource cost entries from Cost Explorer" if enabled else
+        "   allocating resource rows from usage-type breakdown")
+    return out, enabled, clipped
+
+
+# Usage-type substrings -> EC2 (or other) kinds for fallback allocation.
+USAGE_KIND_HINTS = [
+    (re.compile(r"PublicIPv4|InUseAddress|IdleAddress|ElasticIP|IPv4", re.I), {"elastic-ip"}),
+    (re.compile(r"VpcEndpoint|VPCEndpoint|PrivateLink", re.I), {"vpc-endpoint"}),
+    (re.compile(r"NatGateway", re.I), {"natgateway"}),
+    (re.compile(r"ClientVPN", re.I), set()),
+    (re.compile(r"VPN", re.I), {"vpn-connection", "vpn-gateway"}),
+    (re.compile(r"TransitGateway", re.I), {"transit-gateway"}),
+    (re.compile(r"GlobalAccelerator", re.I), {"accelerator"}),
+]
+
+
+def kinds_for_usage_type(usage_type):
+    ut = usage_type or ""
+    if "ClientVPN" in ut:
+        return set()
+    kinds = set()
+    for pat, kset in USAGE_KIND_HINTS:
+        if pat.search(ut):
+            kinds |= kset
+    return kinds
+
+
+def estimate_costs_from_usage(its, usage_rows_for_svc, service_cost=None):
+    """
+    Split each usage-type cost across inventoried resources of matching kind.
+    Unmatched usage (e.g. ClientVPN with no scanned resource) is not forced
+    onto other resources.
+    """
+    by_kind = defaultdict(list)
+    for it in its:
+        by_kind[it["Kind"]].append(it)
+    est = {}
+    unmatched_ut_cost = 0.0
+    for ut, ut_cost in usage_rows_for_svc:
+        pool = []
+        for kind in kinds_for_usage_type(ut):
+            pool.extend(by_kind.get(kind, []))
+        if not pool:
+            unmatched_ut_cost += ut_cost
+            continue
+        share = ut_cost / len(pool)
+        for it in pool:
+            est[it["Key"]] = est.get(it["Key"], 0.0) + share
+
+    # Do not spread unmatched usage (e.g. ClientVPN) onto unrelated inventoried resources.
+
+    # Resources still missing a row: split only among same-kind peers when that kind
+    # had no usage-type mapping (avoid dumping unrelated service $ onto EIPs, etc.).
+    without = [it for it in its if it["Key"] not in est]
+    if without and service_cost is not None:
+        by_kind_left = defaultdict(list)
+        for it in without:
+            by_kind_left[it["Kind"]].append(it)
+        for kind, group in by_kind_left.items():
+            kind_usage = sum(
+                ut_cost for ut, ut_cost in usage_rows_for_svc
+                if kind in kinds_for_usage_type(ut) and ut_cost > 0
+            )
+            if kind_usage > 0:
+                share = kind_usage / len(group)
+                for it in group:
+                    est[it["Key"]] = est.get(it["Key"], 0.0) + share
+
+    return {k: round(v, 4) for k, v in est.items() if round(v, 4) > 0}
+
+
+def index_resource_costs(raw_costs):
+    """(region, service) -> {alias -> cost} (CE resource id keys + match aliases)."""
+    merged = defaultdict(float)
+    for (region, svc, rid), cost in raw_costs.items():
+        merged[(region, svc, rid)] += cost
+    idx = defaultdict(dict)
+    for (region, svc, rid), cost in merged.items():
+        bucket = idx[(region, svc)]
+        bucket[rid] = cost
+        for alias in ce_resource_id_aliases(rid):
+            if alias not in bucket:
+                bucket[alias] = cost
+    return idx
+
+
+def lookup_resource_cost(it, cost_index, estimates):
+    region, svc = it["Region"], it["CostService"]
+    if not svc:
+        return None, ""
+    pool = cost_index.get((region, svc), {})
+    keys = {it["ID"], it["ARN"]}
+    keys |= ce_resource_id_aliases(it["ID"])
+    keys |= ce_resource_id_aliases(it["ARN"])
+    for k in keys:
+        if k in pool:
+            return round(pool[k], 4), "Cost Explorer (resource ID)"
+    rid = it["ID"]
+    for ce_rid, cost in pool.items():
+        if rid and (ce_rid == rid or ce_rid.endswith(rid) or rid in ce_rid):
+            return round(cost, 4), "Cost Explorer (resource ID)"
+    if it["Key"] in estimates:
+        return estimates[it["Key"]], "Estimated (usage type ÷ matching resources)"
+    return None, "No matching usage (see Usage Breakdown sheet)"
 
 
 # ============================================================
@@ -1010,7 +1218,9 @@ def tag_string(tags):
     return "; ".join(f"{k}={v}" for k, v in sorted(tags.items()))
 
 
-def build_report(costs, usage, items, ascending, required_tags):
+def build_report(costs, usage, items, ascending, required_tags,
+                 resource_cost_index=None):
+    resource_cost_index = resource_cost_index or {}
     by_svc = defaultdict(list)
     for it in items:
         if it["CostService"]:
@@ -1069,9 +1279,17 @@ def build_report(costs, usage, items, ascending, required_tags):
             usage_rows.append({"Region": region, "Service": svc, "Usage Type": ut,
                                "Cost (USD)": c})
 
+        estimates = estimate_costs_from_usage(its, usage.get(key, []), service_cost=cost) if its else {}
+
+        allocated = 0.0
         for it in sorted(its, key=lambda i: (bool(i["Tags"]), i["Kind"], i["ID"])):
+            res_cost, cost_src = lookup_resource_cost(it, resource_cost_index, estimates)
+            if res_cost is not None:
+                allocated += res_cost
             row = {
-                "Region": region, "Service": svc, "Service Cost (USD)": cost,
+                "Region": region, "Service": svc,
+                "Resource Cost (USD)": res_cost if res_cost is not None else "",
+                "Cost Source": cost_src,
                 "Resource Type": f"{it['Svc']}:{it['Kind']}", "Resource ID": it["ID"],
                 "Resource Name": it["Name"], "Status": normalize_status(it["State"]),
                 "Raw State": it["State"],
@@ -1090,6 +1308,14 @@ def build_report(costs, usage, items, ascending, required_tags):
             details.append(row)
             if not it["Tags"] or (required_tags and row["Missing Required Tags"]):
                 untagged.append(row)
+
+        if its and allocated and round(allocated, 2) != round(cost, 2):
+            gap = round(cost - allocated, 4)
+            if abs(gap) >= 0.01:
+                log(f"[Billing] {region} · {svc[:36]}: service total ${cost:,.2f}, "
+                    f"allocated to listed resources ${allocated:,.2f} "
+                    f"(unmapped ${gap:,.2f} — deleted resources or usage without inventory)",
+                    verbose_only=True)
 
     return summary, details, untagged, usage_rows
 
@@ -1186,6 +1412,9 @@ def main():
     try:
         ce = get_client(session, "ce", "us-east-1")
         costs, usage = get_costs(ce, start, end, args.min_cost)
+        raw_res_costs, ce_res_enabled, _ = fetch_resource_costs(
+            ce, start, end, costs.keys())
+        resource_cost_index = index_resource_costs(raw_res_costs)
     except (ClientError, BotoCoreError) as exc:
         log(f"Cost Explorer failed: {short(exc, 300)}")
         return
@@ -1235,7 +1464,8 @@ def main():
 
     # 4. Report (always runs)
     summary, details, untagged, usage_rows = build_report(
-        costs, usage, items, args.ascending, required_tags)
+        costs, usage, items, args.ascending, required_tags,
+        resource_cost_index=resource_cost_index)
     print_console_summary(summary)
     no_res = [r for r in summary if r["Resources Found"] == 0]
     if no_res:
@@ -1254,9 +1484,10 @@ def main():
     log(f"Resources listed:     {len(details)}")
     log(f"Untagged / to review: {len(untagged)}")
     log(f"Excel file:           {args.output}")
-    log("\nNotes: cost is per service+region (Cost Explorer has no per-resource cost unless "
-        "resource-level data is enabled). CloudTrail only keeps 90 days of history, so older "
-        "resources show creator 'Unknown'.")
+    log("\nNotes: Region-Service Summary shows total cost per service. Resource Details uses "
+        "Resource Cost (USD) per row (Cost Explorer resource-level data when enabled; otherwise "
+        "usage-type estimates). Per-resource CE data covers at most the last 14 days. CloudTrail "
+        "only keeps 90 days of history, so older resources show creator 'Unknown'.")
 
 
 if __name__ == "__main__":
