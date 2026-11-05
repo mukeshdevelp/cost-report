@@ -1,40 +1,21 @@
 #!/usr/bin/env python3
 """
-AWS Cleanup Audit  (cost-first, tag-focused)
-
-Goal: find billed resources that are not tagged, show who created them and what each
-one costs, so untagged / unused resources can be cleaned up.
+AWS Cleanup Audit — active billed services + untagged resources
 
 Flow
-  1. Cost Explorer -> every Region + Service with cost > 0 (credits/refunds/tax excluded).
-     These service totals are EXACT billing numbers.
-  2. Only regions with cost are scanned for resources (tagging API + service scanners,
-     incl. VPCs, EC2/EBS, RDS, EKS, Lambda, S3, Bedrock, SQS, SNS, KMS, Glue, ...).
-  3. Per-resource cost (always a number):
-        - "Exact (Cost Explorer)"   when Cost Explorer resource-level data is enabled
-                                    (last 14 days only, opt-in in Cost Explorer settings)
-        - "Estimated (usage split)" otherwise: each usage type's cost is split across the
-                                    matching resources (EBS by GiB, others equally)
-        - leftovers (data transfer, requests, deleted resources...) are shown on an
-          "Unallocated" row, so every service's rows add up to its exact total.
-  4. CloudTrail (90 days max) -> IAM user / role session that created each resource.
-  5. Excel:
-        Region-Service Summary   region -> service -> exact cost totals and status counts
-        Resource Details         one row per resource; service total on first row only;
-                                 Resource fields and Tags in separate columns
-        Untagged Resources       the cleanup list
-        Usage Breakdown          usage types per service with cost and % share
-
-No time limits: every API call waits as long as it needs (long timeouts, many retries) and
-CloudTrail lookups have no per-region budget unless you set --region-budget.
+  1. Cost Explorer → Region + Service totals (UnblendedCost; credits/refunds/tax excluded).
+     These numbers match the AWS console when you use the same date range and filters.
+  2. Scan only regions that had cost → list resources missing tags (mapped to a billed service).
+  3. No per-resource cost estimates (they often disagree with the console). Service totals
+     come only from Cost Explorer.
 
 Usage
-  python aws_cleanup_audit.py -v
-  python aws_cleanup_audit.py --skip-cloudtrail          
-  python aws_cleanup_audit.py --days 14                  
-  python aws_cleanup_audit.py --ascending                
-  python aws_cleanup_audit.py --min-cost 0.01
-  python aws_cleanup_audit.py --required-tags Owner,Environment
+  python main.py --regions ap-south-1
+  python main.py --period mtd                        # month-to-date (matches console month picker)
+  python main.py --period rolling --days 10
+  python main.py --excel                             # Active Services + Untagged Resources sheets
+  python main.py --billing-only                      # billing on terminal only, no scan
+  python main.py --with-cloudtrail                   # optional creator lookup (slow)
 """
 
 import argparse
@@ -56,6 +37,20 @@ from botocore.exceptions import BotoCoreError, ClientError
 DEFAULT_PROFILE = "mfa-session"
 DEFAULT_REGION = "ap-south-1"
 DEFAULT_DAYS = 10
+DEFAULT_PERIOD = "mtd"   # month-to-date UTC — aligns with Cost Explorer "This month"
+
+# Cost Explorer API name → text you pick in the console Service filter
+CONSOLE_SERVICE_PICK = {
+    "amazon virtual private cloud": "VPC (Virtual Private Cloud)",
+    "amazon elastic compute cloud - compute": "EC2-Instances",
+    "ec2 - other": "EC2 - Other",
+    "amazon relational database service": "RDS (Relational Database Service)",
+    "amazon elastic container service for kubernetes": "EKS (Elastic Kubernetes Service)",
+    "amazon elastic load balancing": "ELB (Elastic Load Balancing)",
+    "amazon elasticache": "ElastiCache",
+    "aws key management service": "KMS (Key Management Service)",
+    "aws secrets manager": "Secrets Manager",
+}
 
 VERBOSE = False
 STOP = threading.Event()
@@ -130,7 +125,9 @@ def collapse_service_header_rows(rows):
             out.append(row)
             continue
         r = dict(row)
-        r["Region"] = r["Service"] = r["Service Total (USD)"] = ""
+        for k in ("Region", "Service", "Service Total (USD)", "Billing Start",
+                  "Billing End (exclusive)"):
+            r[k] = ""
         out.append(r)
     return out
 
@@ -370,20 +367,68 @@ def cost_keys_for(svc, kind):
 # COST EXPLORER  (service totals = exact)
 # ============================================================
 
+# Usage-line charges only (excludes credits/refunds/tax) — "what you consumed"
 COST_FILTER = {"Not": {"Dimensions": {"Key": "RECORD_TYPE",
                                       "Values": ["Credit", "Refund", "Tax"]}}}
 
 
-def ce_query(ce, start, end, dims, filter_expr=None):
+def cost_entry(net, usage):
+    """net = console Total cost; usage = charges before credits."""
+    return {"net": round(net, 4), "usage": round(usage, 4),
+            "credits": round(usage - net, 4)}
+
+
+def cost_net(entry):
+    return entry["net"] if isinstance(entry, dict) else float(entry)
+
+
+def cost_usage(entry):
+    return entry["usage"] if isinstance(entry, dict) else float(entry)
+
+
+def billing_dates(days, period):
+    """
+    Cost Explorer TimePeriod (End is exclusive).
+    mtd = 1st of current UTC month through today (inclusive).
+    rolling = last `days` full UTC days through today (inclusive).
+    """
+    end_d = datetime.now(timezone.utc).date() + timedelta(days=1)
+    if period == "mtd":
+        start_d = end_d.replace(day=1)
+    elif period == "rolling":
+        start_d = end_d - timedelta(days=days)
+    else:
+        raise ValueError(f"unknown period {period!r}")
+    return start_d.isoformat(), end_d.isoformat()
+
+
+def console_service_label(ce_service_name):
+    low = (ce_service_name or "").lower()
+    for key, label in CONSOLE_SERVICE_PICK.items():
+        if key in low:
+            return label
+    return ce_service_name
+
+
+def ce_granularity(start, end):
+    """Daily matches Cost Explorer console for short windows; monthly for long ones."""
+    start_d = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    return "DAILY" if (end_d - start_d).days <= 62 else "MONTHLY"
+
+
+def ce_query(ce, start, end, dims, filter_expr=COST_FILTER):
     if len(dims) > 2:
         raise ValueError(f"Cost Explorer allows at most 2 GroupBy dimensions, got {len(dims)}")
     params = {
         "TimePeriod": {"Start": start, "End": end},
-        "Granularity": "MONTHLY",
+        "Granularity": ce_granularity(start, end),
         "Metrics": ["UnblendedCost"],
-        "GroupBy": [{"Type": "DIMENSION", "Key": d} for d in dims],
-        "Filter": filter_expr or COST_FILTER,
     }
+    if dims:
+        params["GroupBy"] = [{"Type": "DIMENSION", "Key": d} for d in dims]
+    if filter_expr is not None:
+        params["Filter"] = filter_expr
     out = defaultdict(float)
     while True:
         resp = ce.get_cost_and_usage(**params)
@@ -404,10 +449,16 @@ def service_filter(region, svc):
 
 
 def get_costs(ce, start, end, min_cost):
-    log("\n[Billing] Cost by region + service (credits/refunds/tax excluded)...")
-    raw = ce_query(ce, start, end, ["REGION", "SERVICE"])
-    costs = {k: round(v, 4) for k, v in raw.items() if round(v, 4) > min_cost}
-    log(f"   {len(costs)} region/service pairs with cost > ${min_cost}")
+    log("\n[Billing] Cost by region + service (net = console total; usage = before credits)...")
+    net_raw = ce_query(ce, start, end, ["REGION", "SERVICE"], filter_expr=None)
+    usage_raw = ce_query(ce, start, end, ["REGION", "SERVICE"], filter_expr=COST_FILTER)
+    keys = set(net_raw) | set(usage_raw)
+    costs = {}
+    for k in keys:
+        entry = cost_entry(net_raw.get(k, 0.0), usage_raw.get(k, 0.0))
+        if entry["usage"] > min_cost or abs(entry["net"]) > min_cost:
+            costs[k] = entry
+    log(f"   {len(costs)} region/service pairs (usage or net above ${min_cost})")
 
     usage = defaultdict(list)
     log("[Billing] Usage types per region + service...")
@@ -552,9 +603,11 @@ def kinds_for_usage_type(ut):
 
 
 def estimate_costs(its, usage_rows, service_name=""):
+    """Split usage-type $ (exact from CE) across resources; returns (totals, attribution)."""
     present = {it["Kind"] for it in its}
     svc_l = (service_name or "").lower()
     est = defaultdict(float)
+    attr = defaultdict(list)
     for ut, ut_cost in usage_rows:
         kinds = kinds_for_usage_type(ut) & present
         if kinds:
@@ -568,57 +621,124 @@ def estimate_costs(its, usage_rows, service_name=""):
         weights = [max(float(it.get("Weight", 1) or 1), 0.0001) for it in pool]
         total_w = sum(weights)
         for it, w in zip(pool, weights):
-            est[it["Key"]] += ut_cost * w / total_w
-    return {k: round(v, 4) for k, v in est.items()}
+            share = ut_cost * w / total_w
+            est[it["Key"]] += share
+            attr[it["Key"]].append((ut, round(share, 4)))
+    est = {k: round(v, 4) for k, v in est.items()}
+    return est, dict(attr)
 
 
 def allocate_costs(its, total, usage_rows, exact_pool, service_name=""):
     """
-    -> (item_costs {key: (usd, basis)}, extras [(ce_resource_id, usd)], unallocated_usd)
-    Estimated paths reconcile so resource rows sum to the exact service total from AWS.
+    -> item_costs {key: (usd, source, console_hint)}, extras, unalloc, attribution
+    Does NOT inflate resource rows to match service total — unallocated stays visible.
     """
-    item_costs, extras = {}, []
+    item_costs, extras, attr = {}, [], {}
     paid = [it for it in its if it["Kind"] not in FREE_KINDS]
     for it in its:
         if it["Kind"] in FREE_KINDS:
-            item_costs[it["Key"]] = (0.0, "")
+            item_costs[it["Key"]] = (0.0, "No direct charge", "VPC object — $0 usage line")
 
     if exact_pool:
         got, leftovers = match_exact(paid, exact_pool)
         for it in paid:
-            item_costs[it["Key"]] = (round(got.get(it["Key"], 0.0), 4), "")
+            c = round(got.get(it["Key"], 0.0), 4)
+            if c > 0:
+                item_costs[it["Key"]] = (
+                    c, "Exact (Cost Explorer resource ID)",
+                    "Billing → Cost Explorer → Resource → filter Resource ID",
+                )
+            else:
+                item_costs[it["Key"]] = (0.0, "Not in resource-level CE", "")
         for rid, c in leftovers.items():
             if c >= 0.0001 and rid.lower() != "noresourceid":
                 extras.append((rid, round(c, 4)))
     else:
-        est = estimate_costs(paid, usage_rows, service_name)
+        est, attr = estimate_costs(paid, usage_rows, service_name)
         for it in paid:
-            item_costs[it["Key"]] = (est.get(it["Key"], 0.0), "")
+            c = est.get(it["Key"], 0.0)
+            if c > 0:
+                ut_lines = "; ".join(f"{u} (${v:,.4f})" for u, v in attr.get(it["Key"], []))
+                item_costs[it["Key"]] = (
+                    c, "From usage types (see Usage Breakdown sheet)",
+                    f"Cost Explorer → Group by Usage type: {ut_lines}" if ut_lines else "",
+                )
+            else:
+                item_costs[it["Key"]] = (
+                    0.0, "Not allocated",
+                    "No usage type mapped — check Usage Breakdown for this service",
+                )
 
-    assigned = sum(c for c, _ in item_costs.values()) + sum(c for _, c in extras)
+    assigned = sum(v[0] for v in item_costs.values()) + sum(c for _, c in extras)
     unalloc = round(total - assigned, 4)
+    return item_costs, extras, max(unalloc, 0.0), attr
 
-    if not exact_pool and paid and unalloc >= 0.0001:
-        pool = [it for it in paid if item_costs[it["Key"]][0] > 0] or paid
-        weights = [max(float(it.get("Weight", 1) or 1), 0.0001) for it in pool]
-        tw = sum(weights)
-        for it, w in zip(pool, weights):
-            c, _ = item_costs[it["Key"]]
-            item_costs[it["Key"]] = (round(c + unalloc * w / tw, 4), "")
-        unalloc = 0.0
-    elif not exact_pool and paid and unalloc <= -0.0001:
-        pool = [it for it in paid if item_costs[it["Key"]][0] > 0]
-        if pool:
-            excess = -unalloc
-            tw = sum(item_costs[it["Key"]][0] for it in pool)
-            if tw > 0:
-                for it in pool:
-                    c, _ = item_costs[it["Key"]]
-                    item_costs[it["Key"]] = (round(max(c - excess * c / tw, 0.0), 4), "")
-                assigned = sum(c for c, _ in item_costs.values()) + sum(c for _, c in extras)
-                unalloc = round(total - assigned, 4)
 
-    return item_costs, extras, max(unalloc, 0.0)
+def console_filter_hint(region, svc):
+    pick = console_service_label(svc)
+    return (f"Cost Explorer → Region={region}, Service={pick}, "
+            "Cost type=Unblended cost (Total cost = NET after credits)")
+
+
+def is_active_resource(it):
+    """Resources that are in use (not stopped/deleted) — for the untagged cleanup list."""
+    st = normalize_status(it.get("State"))
+    return st in ("Active", "Pending / Initializing", "Idle / Unattached", "Unknown")
+
+
+def format_usage_attribution(parts):
+    return "; ".join(f"{u} (${v:,.4f})" for u, v in parts)
+
+
+def build_billing_reference(acct, start, end, granularity, costs, usage):
+    """Sheet 1: how to match these numbers in the AWS console."""
+    start_incl = datetime.fromisoformat(start).date()
+    end_excl = datetime.fromisoformat(end).date()
+    end_incl = end_excl - timedelta(days=1)
+    rows = [
+        {"Item": "AWS Account", "Value": acct},
+        {"Item": "Billing period (inclusive)", "Value": f"{start_incl} through {end_incl} (UTC dates)"},
+        {"Item": "Cost Explorer TimePeriod", "Value": f"Start={start}, End={end} (End is exclusive)"},
+        {"Item": "Metric", "Value": "UnblendedCost (same as Unblended cost in console)"},
+        {"Item": "Granularity", "Value": granularity},
+        {"Item": "Excluded record types", "Value": "Credit, Refund, Tax"},
+        {"Item": "Verify service totals", "Value": "Cost Explorer → Cost and usage → Group by Region + Service"},
+        {"Item": "Verify usage lines", "Value": "Use the 'Usage Breakdown' sheet (exact CE usage-type $)"},
+        {"Item": "Verify per-resource $", "Value": "Enable resource-level data in CE Settings; run with --days 14"},
+    ]
+    for (region, svc), entry in sorted(costs.items(), key=lambda x: (-cost_net(x[1]), x[0][0])):
+        ut_sum = round(sum(c for _, c in usage.get((region, svc), [])), 4)
+        rows.append({
+            "Item": f"Check total: {region} / {svc[:50]}",
+            "Value": f"${cost_net(entry):,.4f} net — {console_filter_hint(region, svc)}",
+        })
+        if ut_sum and abs(ut_sum - cost_usage(entry)) > 0.05:
+            rows.append({
+                "Item": f"  (usage types sum ${ut_sum:,.4f})",
+                "Value": "Usage-type sum may differ slightly from service total (normal for CE)",
+            })
+    return rows
+
+
+def build_console_cost_rows(costs, usage, billing_start, billing_end):
+    """Flat list matching Cost Explorer Region + Service + Usage type views."""
+    rows = []
+    for (region, svc), entry in sorted(costs.items(), key=lambda x: (-cost_net(x[1]), x[0][0])):
+        cost = cost_net(entry)
+        rows.append({
+            "Billing Start": billing_start, "Billing End (exclusive)": billing_end,
+            "Region": region, "Service": svc, "Usage Type": "(service total)",
+            "Cost (USD)": cost, "Level": "Service total (verify in console)",
+            "Console": console_filter_hint(region, svc),
+        })
+        for ut, ut_cost in usage.get((region, svc), []):
+            rows.append({
+                "Billing Start": billing_start, "Billing End (exclusive)": billing_end,
+                "Region": region, "Service": svc, "Usage Type": ut,
+                "Cost (USD)": ut_cost, "Level": "Usage type (verify in console)",
+                "Console": f"Group by Usage type → {ut}",
+            })
+    return rows
 
 
 # ============================================================
@@ -1221,8 +1341,8 @@ def merge_items(batches):
 
 def assign_cost_services(items, costs):
     by_region = defaultdict(list)
-    for (region, svc), c in costs.items():
-        by_region[region].append((svc, c, region))
+    for (region, svc), entry in costs.items():
+        by_region[region].append((svc, cost_usage(entry), region))
     for it in items:
         regs = list(GLOBAL_REGIONS) if it["Region"] in GLOBAL_REGIONS else [it["Region"]]
         pool = [x for r in regs for x in by_region.get(r, [])]
@@ -1376,121 +1496,117 @@ def run_creator_lookups(profile, items, days, budget, workers, max_pages):
 # REPORT BUILDING
 # ============================================================
 
-def build_report(costs, usage, items, ascending, required_tags, exact_index):
+def build_active_billing_and_untagged(costs, usage, items, ascending, required_tags,
+                                      billing_start, billing_end, period_label):
+    """Exact CE service totals + untagged inventory (no per-resource $)."""
     by_svc = defaultdict(list)
     for it in items:
         if it["CostService"]:
             by_svc[(it["Region"], it["CostService"])].append(it)
 
     region_total = defaultdict(float)
-    for (region, _), c in costs.items():
-        region_total[region] += c
+    for (region, _), entry in costs.items():
+        region_total[region] += cost_usage(entry)
 
     def order(key):
         region, _ = key
-        c = costs[key]
-        return (-region_total[region], region, c if ascending else -c)
+        u = cost_usage(costs[key])
+        return (-region_total[region], region, u if ascending else -u)
 
-    summary, details, untagged, usage_rows = [], [], [], []
+    active_services, untagged = [], []
     for key in sorted(costs, key=order):
         region, svc = key
-        cost = costs[key]
+        entry = costs[key]
+        net, usage_amt, credits = cost_net(entry), cost_usage(entry), entry["credits"]
         its = by_svc.get(key, [])
-        item_costs, extras, unalloc = allocate_costs(
-            its, cost, usage.get(key, []), exact_index.get(key), service_name=svc)
-        allocated = round(sum(c for c, _ in item_costs.values()) + sum(c for _, c in extras), 4)
-
+        active_its = [it for it in its if is_active_resource(it)]
         counts = defaultdict(int)
-        for it in its:
+        for it in active_its:
             counts[normalize_status(it["State"])] += 1
-        creators = []
-        for it in its:
-            c = it["CreatedBy"]
-            if c and c != "Unknown":
-                lab = f"{c} (via {it['ViaRole']})" if it["ViaRole"] else c
-                if lab not in creators:
-                    creators.append(lab)
-        n_untagged = sum(1 for it in its if not it["Tags"])
+        n_untagged = sum(1 for it in active_its if not it["Tags"])
 
-        top_usage = "; ".join(f"{u} (${c:,.2f})" for u, c in usage.get(key, [])[:3])
-        n_vpc_only = sum(1 for it in its if it.get("Kind") == "vpc")
-        summary.append({
-            "Region": region, "Service": svc, "Cost (USD)": cost,
-            "Resources Found": len(its),
-            "Resource Counts": inventory_breakdown(its),
-            "VPC Count": n_vpc_only if is_vpc_billing_service(svc) else "",
-            "Allocated to Resources (USD)": allocated,
-            "Unallocated (USD)": round(max(unalloc, 0.0), 4),
-            "Untagged Resources": n_untagged,
+        ut_lines = usage.get(key, [])
+        top_usage = "; ".join(f"{u} (${c:,.4f})" for u, c in ut_lines[:5])
+        usage_detail = "\n".join(
+            f"  {c:,.4f}  ({(c / usage_amt * 100) if usage_amt else 0:.1f}%)  {u}"
+            for u, c in ut_lines
+        )
+
+        active_services.append({
+            "Billing Period": period_label,
+            "Billing Start (CE)": billing_start,
+            "Billing End (CE, exclusive)": billing_end,
+            "Region": region,
+            "Service (Cost Explorer)": svc,
+            "Console Service Filter": console_service_label(svc),
+            "Service Cost (USD)": net,
+            "Usage Before Credits (USD)": usage_amt,
+            "Credits Applied (USD)": credits,
+            "Console verify": console_filter_hint(region, svc),
+            "Active Resources": len(active_its),
+            "Untagged (active)": n_untagged,
             "Status": format_status_summary(counts),
-            "Created By (IAM user / session)": "; ".join(creators),
             "Top Usage Types": top_usage,
+            "All Usage Types": usage_detail,
         })
 
-        for ut, c in usage.get(key, []):
-            usage_rows.append({"Region": region, "Service": svc, "Usage Type": ut,
-                               "Cost (USD)": c,
-                               "Share of Service (%)": round(c / cost * 100, 1) if cost else 0.0})
-
-        group = []   # (sort key, row)
-        for it in its:
-            res_cost, _ = item_costs[it["Key"]]
+        for it in active_its:
+            if it["Tags"]:
+                if not required_tags:
+                    continue
+                missing = [t for t in required_tags if t not in it["Tags"]]
+                if not missing:
+                    continue
             cat = resource_category(it)
-            row = strip_detail_columns({
-                "Region": region, "Service": svc, "Service Total (USD)": cost,
-                "Resource Cost (USD)": res_cost,
+            row = {
+                "Billing Period": period_label,
+                "Region": region,
+                "Billed Service": svc,
+                "Service Cost (USD)": net,
+                "Usage Before Credits (USD)": usage_amt,
+                "Console verify": console_filter_hint(region, svc),
                 "Type": cat,
-                "Resource Type": f"{it['Svc']}:{it['Kind']}", "Resource ID": it["ID"],
-                "Resource Name": it["Name"], "Resource": resource_display(it),
+                "Resource ID": it["ID"],
+                "Resource Name": it["Name"],
+                "Resource": resource_display(it),
                 "Status": normalize_status(it["State"]),
-                "Raw State": it["State"],
-                "Created By (IAM user / session)": it["CreatedBy"],
-                "Principal Type": it["PrincipalType"], "Via Role": it["ViaRole"],
-                "Created At": it["CreatedAt"] or fmt_dt(it["Created"]),
-                "Attribution": it["Attribution"],
                 "Tagged?": "Yes" if it["Tags"] else "No",
-                "Tag Count": len(it["Tags"]), "Tags": tag_string(it["Tags"]),
-            })
+                "Tags": tag_string(it["Tags"]),
+            }
             if required_tags:
                 row["Missing Required Tags"] = ", ".join(
                     t for t in required_tags if t not in it["Tags"])
-            group.append(((CATEGORY_SORT.get(cat, 999), cat, bool(it["Tags"]), -res_cost), row))
-            if not it["Tags"] or (required_tags and row.get("Missing Required Tags")):
-                untagged.append(dict(row))
+            if not it["Tags"] or row.get("Missing Required Tags"):
+                untagged.append(row)
 
-        for rid, c in extras:
-            group.append(((998, "Billing-only", 2, -c), strip_detail_columns({
-                "Region": region, "Service": svc, "Service Total (USD)": cost,
-                "Resource Cost (USD)": c,
-                "Type": "Billing-only (not in scan)",
-                "Resource Type": "billing-only", "Resource ID": rid,
-                "Resource Name": "Billed by AWS but not in the resource scan "
-                                 "(deleted or unscanned resource type)",
-                "Resource": rid, "Status": "Status Unknown", "Raw State": "",
-                "Tagged?": "Not scanned", "Tag Count": 0, "Tags": "",
-            })))
+    untagged.sort(key=lambda r: (r["Region"], r["Billed Service"], r["Type"], r["Resource ID"]))
+    prev = None
+    for row in untagged:
+        key = (row["Region"], row["Billed Service"])
+        if key == prev:
+            row["Service Cost (USD)"] = ""
+            row["Usage Before Credits (USD)"] = ""
+            row["Console verify"] = ""
+        else:
+            prev = key
+    return active_services, untagged
 
-        if unalloc >= 0.0001:
-            group.append(((999, "Unallocated", 3, 0), strip_detail_columns({
-                "Region": region, "Service": svc, "Service Total (USD)": cost,
-                "Resource Cost (USD)": unalloc,
-                "Type": "Unallocated",
-                "Resource Type": "unallocated", "Resource ID": "-",
-                "Resource Name": "Unallocated (usage not tied to a single resource in scan)",
-                "Resource": "(unallocated)", "Status": "", "Raw State": "",
-                "Tagged?": "", "Tag Count": 0, "Tags": "",
-            })))
 
-        group.sort(key=lambda t: t[0])
-        block = collapse_service_header_rows([strip_detail_columns(dict(row)) for _, row in group])
-        details.extend(block)
-
-        row_sum = round(sum(r.get("Resource Cost (USD)", 0) or 0 for r in block), 4)
-        if its and abs(row_sum - cost) > 0.02:
-            log(f"[WARN] {region} · {svc[:40]}: service bill ${cost:,.2f} vs "
-                f"resource rows ${row_sum:,.2f}", verbose_only=True)
-
-    return summary, details, untagged, usage_rows
+def build_usage_breakdown(costs, usage, period_label):
+    rows = []
+    for (region, svc), entry in sorted(costs.items(), key=lambda x: (-cost_usage(x[1]), x[0][0])):
+        base = cost_usage(entry)
+        for ut, c in usage.get((region, svc), []):
+            rows.append({
+                "Billing Period": period_label,
+                "Region": region,
+                "Service (Cost Explorer)": svc,
+                "Console Service Filter": console_service_label(svc),
+                "Usage Type": ut,
+                "Cost (USD)": c,
+                "Share of Usage Charges (%)": round(c / base * 100, 1) if base else 0.0,
+            })
+    return rows
 
 
 def write_excel(path, sheets):
@@ -1520,14 +1636,107 @@ def write_excel(path, sheets):
     log(f"[SUCCESS] Report written: {path}")
 
 
-def print_console_summary(summary):
+def print_active_services_console(active_services, period_label):
     log("\n" + "=" * 110)
-    log(f"{'REGION':<16}{'SERVICE':<46}{'COST USD':>11}{'UNALLOC':>10}{'UNTAGGED':>10}  CREATED BY")
+    log(f"ACTIVE BILLED SERVICES — {period_label}")
+    log("Service Cost = console net; Usage Before Credits = consumption before credits")
     log("=" * 110)
-    for r in summary:
-        log(f"{r['Region']:<16}{r['Service'][:44]:<46}{r['Cost (USD)']:>11,.2f}"
-            f"{r['Unallocated (USD)']:>10,.2f}{r['Untagged Resources']:>10}  "
-            f"{r['Created By (IAM user / session)'][:40]}")
+    log(f"{'REGION':<12}{'SERVICE':<38}{'NET':>10}{'USAGE':>10}{'UNTAG':>7}{'ACT':>5}")
+    log("-" * 110)
+    for r in active_services:
+        log(f"{r['Region']:<12}{r['Service (Cost Explorer)'][:36]:<38}"
+            f"{r['Service Cost (USD)']:>10,.2f}{r['Usage Before Credits (USD)']:>10,.2f}"
+            f"{r['Untagged (active)']:>7}{r['Active Resources']:>5}")
+        if abs(r.get("Credits Applied (USD)", 0)) >= 0.01:
+            log(f"   credits: ${r['Credits Applied (USD)']:,.2f}")
+        if r.get("Top Usage Types"):
+            log(f"   usage types: {r['Top Usage Types'][:85]}")
+    total_net = sum(r["Service Cost (USD)"] for r in active_services)
+    total_usage = sum(r["Usage Before Credits (USD)"] for r in active_services)
+    log("-" * 110)
+    log(f"{'TOTAL':<50} net ${total_net:,.2f}   usage ${total_usage:,.2f}  ({len(active_services)} svcs)")
+    log("=" * 110)
+
+
+def print_untagged_console(untagged):
+    log("\n" + "=" * 110)
+    log(f"UNTAGGED RESOURCES (active / in-use, mapped to a billed service): {len(untagged)}")
+    log("=" * 110)
+    if not untagged:
+        log("(none)")
+        return
+    log(f"{'REGION':<14}{'SERVICE':<36}{'TYPE':<22}{'STATUS':<18} RESOURCE")
+    log("-" * 110)
+    for r in untagged:
+        log(f"{r['Region']:<14}{r['Billed Service'][:34]:<36}{r['Type']:<22}"
+            f"{r['Status']:<18} {r['Resource'][:40]}")
+
+
+def print_billing_console(costs, usage, start, end, granularity, acct, ascending=False,
+                          region_filter=None):
+    """
+    Cost Explorer mirror on stdout — verify in console with same dates & Unblended cost.
+    """
+    start_incl = datetime.fromisoformat(start).date()
+    end_excl = datetime.fromisoformat(end).date()
+    end_incl = end_excl - timedelta(days=1)
+
+    log("\n" + "=" * 110)
+    log("BILLING (Cost Explorer) — match this in AWS Console / CLI")
+    log("=" * 110)
+    log(f"Account:     {acct}")
+    log(f"Period:      {start_incl} through {end_incl} (UTC, inclusive)")
+    log(f"CE dates:    Start={start}, End={end}  (End is exclusive — same as API)")
+    log(f"Metric:      Unblended cost")
+    log(f"Granularity: {granularity}")
+    log("Console $:   NET total (after credits) — matches 'Total cost' / 'VPC costs' rows")
+    log("Usage $:     charges BEFORE credits (Usage record type only)")
+    log("Note:        Usage HOURS can be > 0 while cost is $0 when credits cover the service.")
+    log("Console:     Billing → Cost Explorer → same date range → Unblended cost")
+    log("             Filter Region + Service (see below)")
+    log("-" * 110)
+
+    region_total = defaultdict(float)
+    for (region, _), entry in costs.items():
+        if region_filter and region not in region_filter:
+            continue
+        region_total[region] += cost_usage(entry)
+
+    def svc_order(key):
+        region, svc = key
+        u = cost_usage(costs[key])
+        return (-region_total[region], region, u if ascending else -u)
+
+    keys = [k for k in costs if not region_filter or k[0] in region_filter]
+    keys.sort(key=svc_order)
+
+    grand_net, grand_usage = 0.0, 0.0
+    for (region, svc) in keys:
+        entry = costs[(region, svc)]
+        net, usage_amt = cost_net(entry), cost_usage(entry)
+        grand_net += net
+        grand_usage += usage_amt
+        log(f"\n[{region}]  {svc}")
+        log(f"   CONSOLE TOTAL (net USD):     {net:,.4f}")
+        log(f"   Usage charges (before credits): {usage_amt:,.4f}")
+        if abs(entry["credits"]) >= 0.0001:
+            log(f"   Credits applied:             {entry['credits']:,.4f}")
+        log(f"   Console Service filter: {console_service_label(svc)}")
+        log(f"   CE API service name:    {svc}")
+        ut_rows = usage.get((region, svc), [])
+        if not ut_rows:
+            log("   (no usage-type lines returned)")
+            continue
+        ut_sum = sum(c for _, c in ut_rows)
+        log(f"   Usage types ({len(ut_rows)} lines, sum ${ut_sum:,.4f} usage charges):")
+        for ut, ut_cost in ut_rows:
+            pct = (ut_cost / usage_amt * 100) if usage_amt else 0
+            log(f"      {ut_cost:>12,.4f}  ({pct:5.1f}%)  {ut}")
+
+    log("\n" + "-" * 110)
+    log(f"GRAND NET (console): ${grand_net:,.4f}   |   GRAND usage charges: ${grand_usage:,.4f}")
+    log(f"  ({len(keys)} region/service pairs)")
+    log("=" * 110)
 
 
 # ============================================================
@@ -1545,8 +1754,10 @@ def main():
     ap.add_argument("--profile", default=os.getenv("AWS_PROFILE", DEFAULT_PROFILE))
     ap.add_argument("--region", default=DEFAULT_REGION, help="home region for STS")
     ap.add_argument("--regions", help="comma list; default = every region that has cost")
+    ap.add_argument("--period", choices=("mtd", "rolling"), default=DEFAULT_PERIOD,
+                    help="mtd = month-to-date UTC (default); rolling = last --days full days")
     ap.add_argument("--days", type=int, default=DEFAULT_DAYS,
-                    help="billing window (1-90); exact per-resource cost needs <= 14")
+                    help="with --period rolling: number of UTC days through today (1-90)")
     ap.add_argument("--min-cost", type=float, default=0.0,
                     help="keep only services with cost above this (default: anything > $0)")
     ap.add_argument("--ascending", action="store_true",
@@ -1554,13 +1765,18 @@ def main():
     ap.add_argument("--required-tags", default="",
                     help="comma list, e.g. Owner,Environment; adds a 'Missing Required Tags' column")
     ap.add_argument("--output", default="AWS_Cleanup_Audit.xlsx")
-    ap.add_argument("--skip-cloudtrail", action="store_true")
+    ap.add_argument("--with-cloudtrail", action="store_true",
+                    help="lookup resource creators via CloudTrail (slow)")
     ap.add_argument("--region-budget", type=int, default=0,
                     help="max seconds of CloudTrail lookups per region (default 0 = no limit)")
     ap.add_argument("--max-pages", type=int, default=20,
                     help="max CloudTrail pages (50 events each) per resource lookup")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--billing-only", action="store_true",
+                    help="print services + usage-type costs to terminal only; no scan, no Excel")
+    ap.add_argument("--excel", action="store_true",
+                    help="write Excel workbook (full audit; ignored with --billing-only)")
     args = ap.parse_args()
     VERBOSE = args.verbose
 
@@ -1582,10 +1798,13 @@ def main():
     acct, partition = ident["Account"], ident["Arn"].split(":")[1]
     log(f"Account {acct} | {ident['Arn']}")
 
-    end_d = datetime.now(timezone.utc).date() + timedelta(days=1)   # end is exclusive
-    start_d = end_d - timedelta(days=args.days + 1)
-    start, end = start_d.isoformat(), end_d.isoformat()
-    log(f"Billing window: {start} -> {end}")
+    start, end = billing_dates(args.days, args.period)
+    start_incl = datetime.fromisoformat(start).date()
+    end_incl = datetime.fromisoformat(end).date() - timedelta(days=1)
+    period_label = (f"month-to-date {start_incl} .. {end_incl} UTC"
+                    if args.period == "mtd"
+                    else f"last {args.days} days {start_incl} .. {end_incl} UTC")
+    log(f"Billing window ({args.period}): {start} -> {end}  ({period_label})")
 
     # 1. Billing (exact service totals) + exact per-resource costs when available
     try:
@@ -1594,14 +1813,18 @@ def main():
         if not costs:
             log("No services with cost found for this window.")
             return
-        if args.days <= 14:
-            raw_res_costs = fetch_resource_costs(ce, start, end, costs.keys())
-        else:
-            raw_res_costs = {}
-            log("\n[Billing] --days is above 14: Cost Explorer resource-level data only covers "
-                "the last 14 days, so per-resource costs are ESTIMATED from usage types. "
-                "Use --days 14 (or less) for exact per-resource costs.")
-        exact_index = build_exact_index(raw_res_costs)
+        granularity = ce_granularity(start, end)
+        region_filter = None
+        if args.regions:
+            region_filter = {r.strip() for r in args.regions.split(",") if r.strip()}
+        if region_filter:
+            costs = {k: v for k, v in costs.items() if k[0] in region_filter}
+            usage = {k: v for k, v in usage.items() if k[0] in region_filter}
+        print_billing_console(costs, usage, start, end, granularity, acct, args.ascending,
+                              region_filter)
+        if args.billing_only:
+            log("\nBilling-only run complete. Re-run without --billing-only for untagged scan.")
+            return
     except (ClientError, BotoCoreError) as exc:
         log(f"Cost Explorer failed: {short(exc, 300)}")
         return
@@ -1637,43 +1860,40 @@ def main():
             f"{sum(1 for i in billed if not i['Tags'])} of those are untagged")
 
         # 3. Who created them
-        if not args.skip_cloudtrail:
+        if args.with_cloudtrail:
             run_creator_lookups(args.profile, items, 90, args.region_budget,
                                 args.workers, args.max_pages)
         else:
-            log("\n[CloudTrail] skipped")
+            log("\n[CloudTrail] skipped (pass --with-cloudtrail for creator lookup)")
     except KeyboardInterrupt:
         STOP.set()
         log("\n[Interrupted] writing report with what was collected so far...")
 
     # 4. Report (always runs)
-    summary, details, untagged, usage_rows = build_report(
-        costs, usage, items, args.ascending, required_tags, exact_index)
-    print_console_summary(summary)
-    no_res = [r for r in summary if r["Resources Found"] == 0]
-    if no_res:
-        log("\nBilled but NO resources found (usage-based, already deleted, or a service "
-            "this script does not scan - check manually):")
-        for r in no_res:
-            log(f"   {r['Region']:<16}{r['Service'][:60]:<62}${r['Cost (USD)']:,.2f}")
-    write_excel(args.output, [
-        ("Region-Service Summary", summary),
-        ("Resource Details", details),
-        ("Untagged Resources", untagged),
-        ("Usage Breakdown", usage_rows),
-    ])
+    active_services, untagged = build_active_billing_and_untagged(
+        costs, usage, items, args.ascending, required_tags, start, end, period_label)
+    print_active_services_console(active_services, period_label)
+    print_untagged_console(untagged)
 
-    total = sum(r["Cost (USD)"] for r in summary)
-    log(f"\nBilled services:      {len(summary)}   (total ${total:,.2f})")
-    log(f"Resource rows:        {len(details)}")
+    if args.excel:
+        usage_rows = build_usage_breakdown(costs, usage, period_label)
+        for row in active_services:
+            row.pop("All Usage Types", None)
+        write_excel(args.output, [
+            ("Active Services", active_services),
+            ("Usage Breakdown", usage_rows),
+            ("Untagged Resources", untagged),
+        ])
+    else:
+        log("\n[Report] Excel skipped (pass --excel for Active Services + Untagged sheets).")
+
+    total_net = sum(r["Service Cost (USD)"] for r in active_services)
+    total_usage = sum(r["Usage Before Credits (USD)"] for r in active_services)
+    log(f"\nBilled services:      {len(active_services)}   "
+        f"(net ${total_net:,.2f} console  |  usage ${total_usage:,.2f} before credits)")
     log(f"Untagged / to review: {len(untagged)}")
-    log(f"Excel file:           {args.output}")
-    log("\nHow to read the costs: 'Cost (USD)' per service is the exact AWS bill. 'Resource Cost "
-        "(USD)' is exact when Cost Basis says Exact (Cost Explorer resource-level data), otherwise "
-        "an estimate that splits each usage type across matching resources. 'Unallocated' is the "
-        "part of a service's bill that cannot be tied to one resource, so each service's rows "
-        "always add up to its total. CloudTrail keeps 90 days, so older resources show creator "
-        "'Unknown'.")
+    if args.excel:
+        log(f"Excel file:           {args.output}")
 
 
 if __name__ == "__main__":
